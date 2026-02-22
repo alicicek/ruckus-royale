@@ -1,0 +1,72 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Ruckus Royale</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Bangers&family=Space+Grotesk:wght@400;500;700&display=swap"
+      rel="stylesheet"
+    />
+  </head>
+  <body>
+    <div id="app-shell">
+      <canvas id="game-canvas"></canvas>
+
+      <section id="menu-panel" class="panel visible">
+        <h1>Ruckus Royale</h1>
+        <p class="subtitle">Physics-fueled party brawler for friends or solo chaos.</p>
+
+        <label>
+          Player Name
+          <input id="player-name" type="text" maxlength="18" value="Player" />
+        </label>
+
+        <label>
+          Room Code
+          <input id="room-code" type="text" maxlength="8" placeholder="ABCDE" />
+        </label>
+
+        <div class="button-row">
+          <button id="create-room-btn">Create Room</button>
+          <button id="join-room-btn">Join Room</button>
+          <button id="solo-btn">Solo Quick Match</button>
+        </div>
+
+        <div class="button-row secondary">
+          <button id="ready-btn" class="small">Toggle Ready</button>
+          <button id="rematch-btn" class="small">Vote Rematch</button>
+          <button id="fullscreen-btn" class="small">Fullscreen (F)</button>
+        </div>
+
+        <p id="status-text" class="status">Status: Idle</p>
+
+        <ul class="controls">
+          <li>Move: WASD / Left Stick</li>
+          <li>Jump: Space / A</li>
+          <li>Grab / Release: E / RB</li>
+          <li>Light Attack: J / X</li>
+          <li>Heavy Attack: K / B</li>
+          <li>Sprint: Shift / RT</li>
+          <li>Emote: C / Y</li>
+          <li>Fullscreen toggle: F (Esc exits)</li>
+        </ul>
+      </section>
+
+      <section id="hud-panel" class="hud">
+        <div id="hud-room">Room: -</div>
+        <div id="hud-mode">Mode: -</div>
+        <div id="hud-round">Round: -</div>
+        <div id="hud-timer">Time: -</div>
+        <div id="hud-arena">Arena: -</div>
+        <div id="hud-score">Score: -</div>
+      </section>
+
+      <section id="event-feed" class="events"></section>
+    </div>
+
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

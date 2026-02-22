@@ -1,0 +1,23 @@
+{
+  "name": "ruckus-royale",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "dev": "npm run build --workspace @ruckus/shared && concurrently -k -n server,client \"npm:dev --workspace @ruckus/server\" \"npm:dev --workspace @ruckus/client\"",
+    "dev:server": "npm run dev --workspace @ruckus/server",
+    "dev:client": "npm run dev --workspace @ruckus/client",
+    "build": "npm run build --workspace @ruckus/shared && npm run build --workspace @ruckus/server && npm run build --workspace @ruckus/client",
+    "typecheck": "npm run typecheck --workspace @ruckus/shared && npm run typecheck --workspace @ruckus/server && npm run typecheck --workspace @ruckus/client",
+    "test:playwright": "node tests/playwright/run_web_game_client.mjs"
+  },
+  "devDependencies": {
+    "concurrently": "^9.1.2",
+    "playwright": "^1.58.2",
+    "typescript": "^5.8.2"
+  }
+}
