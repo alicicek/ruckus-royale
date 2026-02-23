@@ -25,6 +25,17 @@ export interface InputFrame {
 
 export type PlayerRole = "human" | "bot";
 
+/** Ragdoll visual hints for remote client ragdoll approximation */
+export interface RagdollHintNet {
+  /** 0 = full ragdoll, 1 = full control */
+  stiffness: number;
+  /** Current ragdoll state */
+  state: "active" | "hit" | "knockout" | "recovering";
+  /** Direction of last hit (normalized, for remote ragdoll deformation) */
+  hitDirX: number;
+  hitDirZ: number;
+}
+
 export interface PlayerStateNet {
   id: string;
   name: string;
@@ -43,6 +54,8 @@ export interface PlayerStateNet {
   emoteTimer: number;
   knockouts: number;
   wins: number;
+  /** Ragdoll visual hints for remote players */
+  ragdollHint?: RagdollHintNet;
 }
 
 export interface HazardStateNet {

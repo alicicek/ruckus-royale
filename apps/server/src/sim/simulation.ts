@@ -101,6 +101,11 @@ function createPlayer(id: string, name: string, role: "human" | "bot"): Internal
     latestInput: { ...EMPTY_INPUT },
     queuedSpawn: false,
     spawnDelay: 0,
+    ragdollStiffness: 1,
+    ragdollState: "active",
+    lastHitDirX: 0,
+    lastHitDirZ: 0,
+    ragdollRecoveryTimer: 0,
   };
 }
 
@@ -172,6 +177,15 @@ export class BrawlSimulation {
         emoteTimer: p.emoteTimer,
         knockouts: p.knockouts,
         wins: p.wins,
+        ragdollHint: {
+          stiffness: p.ragdollStiffness,
+          state: p.ragdollState === "hit" ? "hit"
+            : p.ragdollState === "knockout" ? "knockout"
+            : p.ragdollState === "recovering" ? "recovering"
+            : "active",
+          hitDirX: p.lastHitDirX,
+          hitDirZ: p.lastHitDirZ,
+        },
       })),
       hazards: this.hazards.map((hazard) => ({
         id: hazard.id,
@@ -293,6 +307,24 @@ export class BrawlSimulation {
       player.grabCooldown = Math.max(0, player.grabCooldown - dt);
       player.emoteTimer = Math.max(0, player.emoteTimer - dt);
       player.stun = Math.max(0, player.stun - dt * 8.5);
+
+      // Update ragdoll hint state machine
+      if (player.ragdollRecoveryTimer > 0) {
+        player.ragdollRecoveryTimer -= dt;
+        if (player.ragdollRecoveryTimer <= 0) {
+          player.ragdollState = "recovering";
+        }
+      }
+      if (player.ragdollState === "recovering") {
+        player.ragdollStiffness = Math.min(1, player.ragdollStiffness + 2.5 * dt);
+        if (player.ragdollStiffness >= 0.99) {
+          player.ragdollStiffness = 1;
+          player.ragdollState = "active";
+        }
+      }
+      if (player.ragdollState === "active" && player.stun > 0) {
+        player.ragdollStiffness = 1 - Math.min(0.5, player.stun * 0.005);
+      }
     }
 
     switch (this.roundState.phase) {
@@ -617,6 +649,13 @@ export class BrawlSimulation {
       target.velocity.z += dir.z * impulse * pressure;
       target.stun += damage * pressure;
 
+      // Update ragdoll hints
+      target.lastHitDirX = dir.x;
+      target.lastHitDirZ = dir.z;
+      target.ragdollState = "hit";
+      target.ragdollStiffness = isHeavy ? 0.15 : 0.35;
+      target.ragdollRecoveryTimer = isHeavy ? 0.4 : 0.25;
+
       if (target.grabbedById) {
         this.releaseGrab(target.grabbedById);
       }
@@ -629,6 +668,7 @@ export class BrawlSimulation {
           actorId: attacker.id,
           targetId: target.id,
           atTick: this.serverTick,
+          message: isHeavy ? "heavy" : "light",
         });
       }
     }
@@ -825,6 +865,11 @@ export class BrawlSimulation {
     player.velocity.y = 0;
     player.velocity.z = 0;
     player.knockouts += 1;
+
+    // Ragdoll hints: full knockout
+    player.ragdollState = "knockout";
+    player.ragdollStiffness = 0;
+    player.ragdollRecoveryTimer = 1.2;
 
     this.onRoundEvent({
       type: "knockout",
@@ -1126,6 +1171,11 @@ export class BrawlSimulation {
     player.emoteTimer = 0;
     player.queuedSpawn = false;
     player.spawnDelay = 0;
+    player.ragdollStiffness = 1;
+    player.ragdollState = "active";
+    player.lastHitDirX = 0;
+    player.lastHitDirZ = 0;
+    player.ragdollRecoveryTimer = 0;
   }
 
   private spawnPlayer(player: InternalPlayerState): void {

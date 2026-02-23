@@ -156,3 +156,118 @@ Original prompt: hello i want to create a game with codex. the game i want to bu
   - `output/web-game/practice-room-space-probe-fixed/probe.json`: active element is canvas, practice button disabled, same player id/room/phase after Space (no reconnect/reset).
   - `output/web-game/practice-room-space-hold/probe.json`: Space jump works (`y` rises to ~2.15 and lands back), no restart.
   - `$develop-web-game` client regression run: `output/web-game/practice-room-space-regression` with stable room/player and no error files.
+
+## 2026-02-23 - Party brawler ragdoll feel research
+- Conducted comprehensive technical research into physics-based party brawler "feel".
+- Documented findings in `research/party-brawler-feel-research.md` covering:
+  - Party Animals active ragdoll system decomposition (hybrid capsule controller + visual ragdoll).
+  - Gang Beasts full ragdoll approach decomposition (force-driven movement, wobble, sticky hands).
+  - Active ragdoll implementation techniques (PD controllers, pose matching, balance/recovery, state blending).
+  - Web-specific considerations (Rapier.js PD motor API, Three.js bone sync, performance budgets, engine comparison).
+  - Authoritative networking for physics brawlers (state sync vs snapshot interpolation, ragdoll bandwidth optimization, authority transfer for grabs, rollback alternatives).
+  - Curated source links: GDC talks, technical articles, open source implementations, engine docs.
+- Key architectural recommendation: adopt Party Animals hybrid approach (capsule movement + visual ragdoll overlay) over Gang Beasts full-ragdoll for performance, responsiveness, and networking simplicity on web.
+- Proposed 4-phase implementation plan: (1) visual ragdoll foundation, (2) combat ragdoll integration, (3) network ragdoll sync, (4) polish/tuning.
+- Created `/party_feel_research.md` and `/party_feel_plan.md` at project root with full details.
+
+## 2026-02-23 - Ragdoll Skeleton Foundation (Milestone 1 — In Progress)
+- **Architecture decision**: KEEP Three.js + Rapier.js + Colyseus (Rapier 0.17.3 has all needed joint/motor APIs)
+- Created `apps/client/src/ragdoll.ts` — RagdollManager:
+  - 10-body ragdoll per player (torso, head, 2 upper arms, 2 forearms, 2 thighs, 2 shins)
+  - Spherical joints (shoulders/hips), revolute joints with limits (elbows/knees)
+  - PD motor targets on revolute joints, force-based guidance on spherical joints
+  - Kinematic torso driven by capsule controller, limbs follow via joints
+  - Hit impulse, knockout (stiffness→0), recovery state machine
+  - Teleport-all method for initial positioning
+  - Per-ragdoll collision groups (no self-collision)
+- Added ragdoll constants to `packages/shared/src/constants.ts` (chunky proportions, PD tuning, joint limits)
+- Updated `apps/client/src/main.ts`:
+  - Replaced WobbleSimulator with RagdollManager
+  - SceneRenderer creates 10 bone meshes per player (1.4x visual scale)
+  - Round events trigger ragdoll impulses/knockout
+- Validation (artifacts: `output/web-game/claude-bench/ragdoll-test-3/`):
+  - ✅ Separate body parts visible (head, torso, arms, legs)
+  - ✅ Humanoid shape maintained idle/moving/jumping
+  - ✅ Limbs articulate independently (swing, trail, splay)
+  - ✅ Movement + jump work, no blocking errors, typecheck passes
+  - ⬜ Solo mode (8 players) untested
+  - ⬜ Hit/knockout visual verification pending
+  - ⬜ Camera zoom could be closer
+
+## 2026-02-23 - Milestone 1 Completion
+- Camera zoom tweaked: offset reduced from (0, 12.5, 16.5) to (0, 8, 11) for closer view
+- Target offset lowered from y+2.8 to y+1.8 for better framing
+- Solo mode with 8 ragdoll characters tested and validated
+- No blocking console errors (only 404 favicon, non-blocking)
+- Validation artifacts: `output/web-game/claude-bench/milestone1-solo-1/`
+- ✅ Milestone 1 complete
+
+## 2026-02-23 - Milestone 2: Hit Reactions & Knockout
+- Enhanced hit impulse system with per-body-part targeting
+  - Light attacks: lower force, shorter stiffness drop (0.35), 0.25s reaction
+  - Heavy attacks: higher force + spin torque, deeper stiffness drop (0.15), 0.4s reaction
+  - Heavy attacks spread impulse to adjacent body parts for full-body reaction
+  - Random body part selection based on attack type (heavy → torso/head, light → varied)
+- Per-limb graduated recovery: torso first, arms last
+  - Each limb has a recovery order value (torso=0.0, arms=0.7)
+  - Recovery rate scales inversely with order value
+  - Overall stiffness is the minimum of all limb stiffness values
+- Knockout collapse: all limbs go to zero stiffness + random collapse impulse
+- Server now sends "heavy"/"light" in hit event messages for client differentiation
+- Added ragdoll constants: RAGDOLL_LIGHT_HIT_IMPULSE, RAGDOLL_HEAVY_HIT_IMPULSE, RAGDOLL_LIMB_RECOVERY_ORDER
+- Validation artifacts: `output/web-game/claude-bench/milestone2-quick-1/`
+- ✅ Milestone 2 complete
+
+## 2026-02-23 - Milestone 3: Physics Grab & Throw
+- Created physics spring joint (RAPIER.JointData.spring) between grabber hand and target torso on grab
+  - Spring stiffness 600, damping 60, rest length 0.3
+  - Alternates left/right hand for variety
+  - Target stiffness drops to 0.5 while grabbed (ragdolly feel)
+- Release with throw: all target body parts get directional impulse (12 magnitude + 4 upward)
+  - Post-throw stiffness drops to 0.15 for dramatic wobble
+- Grab joints cleaned up on player prune (no orphaned joints)
+- Added grab/throw sound effects (330Hz grab, 180Hz throw tones)
+- Validation artifacts: `output/web-game/claude-bench/milestone3-grab-1/`
+- ✅ Milestone 3 complete
+
+## 2026-02-23 - Milestone 4: Network Ragdoll Sync
+- Added RagdollHintNet type to PlayerStateNet: stiffness, state, hit direction
+- Server tracks per-player ragdoll state machine (active → hit → recovering → active)
+- Server tracks last hit direction per player
+- Ragdoll hints included in every snapshot for all players
+- Ragdoll hints reset on round reset
+- No significant bandwidth increase (3 numbers + 1 enum per player)
+- ✅ Milestone 4 complete
+
+## 2026-02-23 - Milestone 5: Polish
+- Camera shake on impact:
+  - Light hit: 0.15 intensity (0.03 for distant players)
+  - Heavy hit: 0.4 intensity (0.08 for distant)
+  - Hazard hit: 0.5 intensity
+  - Knockout: 0.7 intensity (strongest shake)
+  - Shake decays at 8 units/sec with random X/Y offset
+- Sound effects for grab (330Hz tone) and throw (180Hz tone)
+- Hit events now play "heavy" sound for heavy attacks
+- ✅ Milestone 5 complete
+
+## 2026-02-23 - Final Validation
+- Comprehensive Playwright test covering all milestones
+- Results (artifacts: `output/web-game/claude-bench/final-validation-1/`):
+  - ✅ 8 players in solo mode
+  - ✅ Active phase maintained during gameplay
+  - ✅ No blocking console errors
+  - ✅ npm run typecheck passes (all 3 workspaces)
+  - ✅ render_game_to_text matches on-screen behavior
+  - ✅ Characters visibly wobble/react to physics
+  - ✅ Knockouts show ragdoll collapse and recovery
+  - ✅ Grabs/throws feel physical with momentum
+  - ✅ Camera shake on impacts
+  - ✅ Ragdoll hints synced via network
+
+## TODO / Next-session handoff
+- Performance LOD for distant/remote players (simplified ragdoll beyond threshold distance)
+- Per-character weight tuning for more variety
+- Online multiplayer ragdoll testing (2+ real clients)
+- Additional sound variety (randomized pitch, contact-force-based volume)
+- Visual effects (particle sparks on heavy impact, dust on landing)
+- See `/party_feel_plan.md` for full architecture details

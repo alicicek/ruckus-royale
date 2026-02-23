@@ -18,6 +18,12 @@ export interface InternalPlayerState extends PlayerStateNet {
   spawnDelay: number;
   botDifficulty?: BotDifficulty;
   botMind?: BotMind;
+  /** Server-side ragdoll hint tracking */
+  ragdollStiffness: number;
+  ragdollState: "active" | "hit" | "knockout" | "recovering";
+  lastHitDirX: number;
+  lastHitDirZ: number;
+  ragdollRecoveryTimer: number;
 }
 
 export interface InternalHazard extends HazardStateNet {

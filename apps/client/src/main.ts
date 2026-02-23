@@ -1,5 +1,9 @@
 import "./style.css";
 import * as THREE from "three";
+import { EffectComposer } from "three/examples/jsm/postprocessing/EffectComposer.js";
+import { RenderPass } from "three/examples/jsm/postprocessing/RenderPass.js";
+import { UnrealBloomPass } from "three/examples/jsm/postprocessing/UnrealBloomPass.js";
+import { OutputPass } from "three/examples/jsm/postprocessing/OutputPass.js";
 import RAPIER from "@dimforge/rapier3d-compat";
 import { Client as ColyseusClient, Room } from "colyseus.js";
 import { Howl, Howler } from "howler";
@@ -8,6 +12,14 @@ import {
   ROOM_NAME,
   SERVER_TICK_DT,
   SERVER_TICK_RATE,
+  RAGDOLL_TORSO_HALF_HEIGHT,
+  RAGDOLL_TORSO_RADIUS,
+  RAGDOLL_HEAD_RADIUS,
+  RAGDOLL_UPPER_ARM_HALF_LENGTH,
+  RAGDOLL_LOWER_ARM_HALF_LENGTH,
+  RAGDOLL_THIGH_HALF_LENGTH,
+  RAGDOLL_SHIN_HALF_LENGTH,
+  RAGDOLL_LIMB_RADIUS,
   clamp,
   integrateMotion,
   type ArenaId,
@@ -19,6 +31,9 @@ import {
   type RoundEvent,
   type SnapshotNet,
 } from "@ruckus/shared";
+import { RagdollManager, type BoneName, type RagdollBoneTransform } from "./ragdoll";
+import { ParticleManager } from "./particles";
+import { CharacterLoader, REVERSE_BONE_MAP, ANIM_MAP, type GameAnimState } from "./character-loader";
 
 const SERVER_URL = import.meta.env.VITE_SERVER_URL ?? "http://localhost:2567";
 const SERVER_HTTP_URL = SERVER_URL.replace(/^ws/i, "http");
@@ -59,8 +74,26 @@ interface PlayerVisual {
   head: THREE.Mesh;
   leftArm: THREE.Mesh;
   rightArm: THREE.Mesh;
+  leftForearm: THREE.Mesh;
+  rightForearm: THREE.Mesh;
+  leftThigh: THREE.Mesh;
+  rightThigh: THREE.Mesh;
+  leftShin: THREE.Mesh;
+  rightShin: THREE.Mesh;
   emote: THREE.Mesh;
   color: THREE.Color;
+  /** Map bone names to the mesh that represents them (fallback mode) */
+  boneMeshes: Map<BoneName, THREE.Mesh>;
+  /** Hit flash state */
+  flashTimer: number;
+  originalEmissives: Map<THREE.Mesh, THREE.Color>;
+  /** GLTF character state (null = fallback capsule mode) */
+  gltfGroup: THREE.Group | null;
+  gltfBones: Map<BoneName, THREE.Bone> | null;
+  gltfMeshes: THREE.SkinnedMesh[];
+  mixer: THREE.AnimationMixer | null;
+  currentAnim: GameAnimState | null;
+  animActions: Map<string, THREE.AnimationAction>;
 }
 
 const hashToHue = (value: string) => {
@@ -70,6 +103,33 @@ const hashToHue = (value: string) => {
   }
   return hash % 360;
 };
+
+/** Creates a 4-band gradient texture for cel-shading */
+function createToonGradientMap(): THREE.DataTexture {
+  const data = new Uint8Array([40, 120, 200, 255]);
+  const texture = new THREE.DataTexture(data, 4, 1, THREE.RedFormat);
+  texture.minFilter = THREE.NearestFilter;
+  texture.magFilter = THREE.NearestFilter;
+  texture.needsUpdate = true;
+  return texture;
+}
+
+/** Patches MeshToonMaterial to add fresnel rim-light glow on edges */
+function addFresnelRim(material: THREE.MeshToonMaterial): void {
+  material.onBeforeCompile = (shader) => {
+    shader.fragmentShader = shader.fragmentShader.replace(
+      "#include <dithering_fragment>",
+      `
+      // Fresnel rim lighting
+      vec3 viewDir = normalize(vViewPosition);
+      vec3 worldNormal = normalize(vNormal);
+      float fresnel = pow(1.0 - abs(dot(viewDir, worldNormal)), 2.5);
+      gl_FragColor.rgb += vec3(0.55, 0.72, 0.9) * fresnel * 0.45;
+      #include <dithering_fragment>
+      `,
+    );
+  };
+}
 
 function toneWavDataUri(frequency: number, durationMs: number): string {
   const sampleRate = 22050;
@@ -135,6 +195,16 @@ class AudioBank {
     volume: 0.14,
   });
 
+  private readonly grab = new Howl({
+    src: [toneWavDataUri(330, 80)],
+    volume: 0.12,
+  });
+
+  private readonly throwSfx = new Howl({
+    src: [toneWavDataUri(180, 150)],
+    volume: 0.18,
+  });
+
   constructor() {
     Howler.volume(0.6);
   }
@@ -143,7 +213,7 @@ class AudioBank {
     Howler.ctx?.resume().catch(() => undefined);
   }
 
-  play(name: "hit" | "heavy" | "knockout" | "round"): void {
+  play(name: "hit" | "heavy" | "knockout" | "round" | "grab" | "throw"): void {
     switch (name) {
       case "hit":
         this.hit.play();
@@ -156,6 +226,12 @@ class AudioBank {
         break;
       case "round":
         this.round.play();
+        break;
+      case "grab":
+        this.grab.play();
+        break;
+      case "throw":
+        this.throwSfx.play();
         break;
     }
   }
@@ -232,112 +308,105 @@ class InputController {
   }
 }
 
-class WobbleSimulator {
-  private readonly world = new RAPIER.World({ x: 0, y: 0, z: 0 });
-  private readonly bodies = new Map<string, RAPIER.RigidBody>();
-
-  ensure(id: string): RAPIER.RigidBody {
-    const existing = this.bodies.get(id);
-    if (existing) return existing;
-
-    const rb = this.world.createRigidBody(
-      RAPIER.RigidBodyDesc.dynamic()
-        .setTranslation(0, 0, 0)
-        .setLinearDamping(5)
-        .setAngularDamping(6),
-    );
-    this.world.createCollider(RAPIER.ColliderDesc.ball(0.18).setRestitution(0.2), rb);
-    this.bodies.set(id, rb);
-    return rb;
-  }
-
-  drive(id: string, velocity: { x: number; y: number; z: number }, stun: number): void {
-    const body = this.ensure(id);
-    body.applyImpulse(
-      {
-        x: velocity.x * 0.03,
-        y: velocity.y * 0.02 + stun * 0.0003,
-        z: velocity.z * 0.03,
-      },
-      true,
-    );
-  }
-
-  prune(activeIds: Set<string>): void {
-    for (const [id, body] of this.bodies.entries()) {
-      if (activeIds.has(id)) continue;
-      this.world.removeRigidBody(body);
-      this.bodies.delete(id);
-    }
-  }
-
-  step(dt: number): void {
-    this.world.timestep = dt;
-    this.world.step();
-
-    for (const body of this.bodies.values()) {
-      const t = body.translation();
-      body.setTranslation(
-        {
-          x: t.x * 0.9,
-          y: t.y * 0.9,
-          z: t.z * 0.9,
-        },
-        true,
-      );
-    }
-  }
-
-  sample(id: string): { x: number; y: number; z: number } {
-    const body = this.bodies.get(id);
-    if (!body) return { x: 0, y: 0, z: 0 };
-    const t = body.translation();
-    return { x: t.x, y: t.y, z: t.z };
-  }
-}
+// WobbleSimulator replaced by RagdollManager (see ragdoll.ts)
 
 class SceneRenderer {
   private readonly renderer: THREE.WebGLRenderer;
   private readonly scene: THREE.Scene;
   private readonly camera: THREE.PerspectiveCamera;
+  private readonly composer: EffectComposer;
+  private readonly toonGradientMap: THREE.DataTexture;
 
   private readonly arenaGroup = new THREE.Group();
   private readonly hazardGroup = new THREE.Group();
   private readonly playerGroup = new THREE.Group();
 
   private readonly playerVisuals = new Map<string, PlayerVisual>();
+
+  // Camera shake state
+  private shakeIntensity = 0;
+  private shakeDecay = 8; // shake decays per second
   private readonly hazardVisuals = new Map<string, THREE.Mesh>();
   private readonly matteShadow = new THREE.Mesh(
     new THREE.CircleGeometry(0.65, 20),
     new THREE.MeshBasicMaterial({ color: 0x04080f, transparent: true, opacity: 0.35 }),
   );
 
+  private readonly particles: ParticleManager;
+  private readonly characterLoader: CharacterLoader;
+  private readonly airborneState = new Map<string, boolean>();
+
   private activeArena: ArenaId | null = null;
   private elapsed = 0;
 
   constructor(
     private readonly canvas: HTMLCanvasElement,
-    private readonly wobble: WobbleSimulator,
+    private readonly ragdolls: RagdollManager,
   ) {
     this.renderer = new THREE.WebGLRenderer({ canvas, antialias: true, powerPreference: "high-performance" });
     this.renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
     this.renderer.outputColorSpace = THREE.SRGBColorSpace;
 
+    // Shadows
+    this.renderer.shadowMap.enabled = true;
+    this.renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+
+    // Tone mapping
+    this.renderer.toneMapping = THREE.ACESFilmicToneMapping;
+    this.renderer.toneMappingExposure = 1.1;
+
     this.scene = new THREE.Scene();
-    this.scene.background = new THREE.Color(0x13263b);
-    this.scene.fog = new THREE.Fog(0x0f1b28, 25, 58);
+    this.scene.background = new THREE.Color(0x1a3048);
+    this.scene.fog = new THREE.Fog(0x162a3c, 25, 58);
 
     this.camera = new THREE.PerspectiveCamera(60, 1, 0.1, 140);
     this.camera.position.set(0, 14, 19);
 
-    const hemi = new THREE.HemisphereLight(0xe3f5ff, 0x102338, 1.15);
-    const key = new THREE.DirectionalLight(0xffefd4, 1.2);
+    // Warm hemisphere light
+    const hemi = new THREE.HemisphereLight(0xfff5e6, 0x1a3050, 1.15);
+    // Key light with shadows
+    const key = new THREE.DirectionalLight(0xfff0d6, 1.3);
     key.position.set(10, 16, 8);
+    key.castShadow = true;
+    key.shadow.mapSize.width = 1024;
+    key.shadow.mapSize.height = 1024;
+    key.shadow.camera.near = 1;
+    key.shadow.camera.far = 50;
+    key.shadow.camera.left = -20;
+    key.shadow.camera.right = 20;
+    key.shadow.camera.top = 20;
+    key.shadow.camera.bottom = -20;
+    // Rim light
     const rim = new THREE.DirectionalLight(0x77d0ff, 0.7);
     rim.position.set(-12, 9, -8);
+    // Fill light
+    const fill = new THREE.DirectionalLight(0xd4e8ff, 0.35);
+    fill.position.set(-6, 4, 12);
 
-    this.scene.add(hemi, key, rim);
+    this.scene.add(hemi, key, rim, fill);
     this.scene.add(this.arenaGroup, this.hazardGroup, this.playerGroup);
+
+    // Toon gradient map for cel-shading
+    this.toonGradientMap = createToonGradientMap();
+
+    // VFX particle system
+    this.particles = new ParticleManager(this.scene);
+
+    // Character loader (starts loading GLTF assets in background)
+    this.characterLoader = new CharacterLoader();
+    this.characterLoader.loadAll().catch((e) => console.warn("Character load failed, using fallback:", e));
+
+    // Post-processing: bloom for glow effects
+    this.composer = new EffectComposer(this.renderer);
+    this.composer.addPass(new RenderPass(this.scene, this.camera));
+    const bloomPass = new UnrealBloomPass(
+      new THREE.Vector2(window.innerWidth, window.innerHeight),
+      0.3,  // strength
+      0.4,  // radius
+      0.85, // threshold
+    );
+    this.composer.addPass(bloomPass);
+    this.composer.addPass(new OutputPass());
 
     this.resize();
     window.addEventListener("resize", () => this.resize());
@@ -347,8 +416,56 @@ class SceneRenderer {
     const width = this.canvas.clientWidth || window.innerWidth;
     const height = this.canvas.clientHeight || window.innerHeight;
     this.renderer.setSize(width, height, false);
+    this.composer.setSize(width, height);
     this.camera.aspect = width / Math.max(1, height);
     this.camera.updateProjectionMatrix();
+  }
+
+  /** Trigger camera shake (intensity 0-1) */
+  addCameraShake(intensity: number): void {
+    this.shakeIntensity = Math.min(1, this.shakeIntensity + intensity);
+  }
+
+  /** Flash a player white for hit feedback */
+  flashPlayer(id: string): void {
+    const visual = this.playerVisuals.get(id);
+    if (!visual) return;
+    visual.flashTimer = 0.15;
+  }
+
+  /** Spawn hit VFX sparks at a player's torso. */
+  spawnHitVFX(playerId: string, isHeavy: boolean): void {
+    const pos = this.ragdolls.getBoneTransform(playerId, "torso");
+    if (!pos) return;
+    const count = isHeavy ? 15 : 8;
+    this.particles.burst(pos, count, isHeavy ? 6 : 4, 0xfffae0, 0.35);
+    if (isHeavy) {
+      this.particles.burst(pos, 5, 3, 0xffaa33, 0.4);
+    }
+  }
+
+  /** Spawn knockout VFX — big burst of red + yellow sparks. */
+  spawnKnockoutVFX(playerId: string): void {
+    const pos = this.ragdolls.getBoneTransform(playerId, "torso");
+    if (!pos) return;
+    this.particles.burst(pos, 25, 7, 0xff4444, 0.5);
+    this.particles.burst(pos, 10, 5, 0xffdd44, 0.45);
+  }
+
+  /** Trigger an attack animation on a player's GLTF model. */
+  triggerAttackAnim(playerId: string, type: "light" | "heavy"): void {
+    const visual = this.playerVisuals.get(playerId);
+    if (!visual?.mixer) return;
+    const animState: GameAnimState = type === "heavy" ? "heavy_attack" : "light_attack";
+    this.crossfadeAnim(visual, animState);
+  }
+
+  /** Spawn grab VFX — blue particles at hand. */
+  spawnGrabVFX(grabberId: string): void {
+    const pos = this.ragdolls.getBoneTransform(grabberId, "r_lower_arm")
+      ?? this.ragdolls.getBoneTransform(grabberId, "torso");
+    if (!pos) return;
+    this.particles.burst(pos, 6, 3, 0x44aaff, 0.3);
   }
 
   setArena(arena: ArenaId): void {
@@ -360,24 +477,27 @@ class SceneRenderer {
     const floorGeo = new THREE.BoxGeometry(26, 0.6, 20);
     const edgeGeo = new THREE.BoxGeometry(26, 0.4, 1.2);
 
+    const gm = this.toonGradientMap;
+
     if (arena === "cargo_rooftop") {
       const floor = new THREE.Mesh(
         floorGeo,
-        new THREE.MeshStandardMaterial({ color: 0x4f5f70, roughness: 0.82, metalness: 0.28 }),
+        new THREE.MeshToonMaterial({ color: 0x4f5f70, gradientMap: gm }),
       );
       floor.position.y = -0.3;
+      floor.receiveShadow = true;
       this.arenaGroup.add(floor);
 
       for (let i = -2; i <= 2; i += 1) {
         const stripe = new THREE.Mesh(
           new THREE.BoxGeometry(2.1, 0.05, 18),
-          new THREE.MeshStandardMaterial({ color: 0xf2af3a, roughness: 0.7 }),
+          new THREE.MeshToonMaterial({ color: 0xf2af3a, gradientMap: gm }),
         );
         stripe.position.set(i * 4.2, 0.05, 0);
         this.arenaGroup.add(stripe);
       }
 
-      const brokenEdge = new THREE.Mesh(edgeGeo, new THREE.MeshStandardMaterial({ color: 0x30353e }));
+      const brokenEdge = new THREE.Mesh(edgeGeo, new THREE.MeshToonMaterial({ color: 0x30353e, gradientMap: gm }));
       brokenEdge.position.set(0, 0.2, -9.7);
       this.arenaGroup.add(brokenEdge);
     }
@@ -385,15 +505,16 @@ class SceneRenderer {
     if (arena === "ferry_deck") {
       const floor = new THREE.Mesh(
         floorGeo,
-        new THREE.MeshStandardMaterial({ color: 0x1f6f8b, roughness: 0.35, metalness: 0.25 }),
+        new THREE.MeshToonMaterial({ color: 0x1f6f8b, gradientMap: gm }),
       );
       floor.position.y = -0.3;
+      floor.receiveShadow = true;
       this.arenaGroup.add(floor);
 
       for (let i = 0; i < 12; i += 1) {
         const lane = new THREE.Mesh(
           new THREE.BoxGeometry(1.3, 0.04, 0.35),
-          new THREE.MeshStandardMaterial({ color: 0xffcc4d, roughness: 0.6 }),
+          new THREE.MeshToonMaterial({ color: 0xffcc4d, gradientMap: gm }),
         );
         lane.position.set(-7 + i * 1.3, 0.04, 0);
         this.arenaGroup.add(lane);
@@ -401,7 +522,7 @@ class SceneRenderer {
 
       const wake = new THREE.Mesh(
         new THREE.TorusGeometry(9.5, 0.2, 16, 100),
-        new THREE.MeshStandardMaterial({ color: 0x6ce8ff, emissive: 0x1d8fab, emissiveIntensity: 0.3 }),
+        new THREE.MeshToonMaterial({ color: 0x6ce8ff, emissive: 0x1d8fab, emissiveIntensity: 0.3, gradientMap: gm }),
       );
       wake.rotation.x = Math.PI / 2;
       wake.position.y = -0.1;
@@ -411,15 +532,16 @@ class SceneRenderer {
     if (arena === "factory_pit") {
       const floor = new THREE.Mesh(
         floorGeo,
-        new THREE.MeshStandardMaterial({ color: 0x2e2f34, roughness: 0.9, metalness: 0.1 }),
+        new THREE.MeshToonMaterial({ color: 0x2e2f34, gradientMap: gm }),
       );
       floor.position.y = -0.3;
+      floor.receiveShadow = true;
       this.arenaGroup.add(floor);
 
       for (const z of [-2.2, 2.2]) {
         const conveyor = new THREE.Mesh(
           new THREE.BoxGeometry(18, 0.14, 2.8),
-          new THREE.MeshStandardMaterial({ color: 0x666f7c, roughness: 0.58, metalness: 0.34 }),
+          new THREE.MeshToonMaterial({ color: 0x666f7c, gradientMap: gm }),
         );
         conveyor.position.set(0, 0.05, z);
         this.arenaGroup.add(conveyor);
@@ -428,7 +550,7 @@ class SceneRenderer {
       for (const x of [-3.2, 3.2]) {
         const press = new THREE.Mesh(
           new THREE.CylinderGeometry(1, 1, 2.2, 28),
-          new THREE.MeshStandardMaterial({ color: 0x7b3131, roughness: 0.65, metalness: 0.34 }),
+          new THREE.MeshToonMaterial({ color: 0x7b3131, gradientMap: gm }),
         );
         press.position.set(x, 1.4, 0);
         this.arenaGroup.add(press);
@@ -454,47 +576,178 @@ class SceneRenderer {
     if (existing) return existing;
 
     const hue = hashToHue(id);
-    const color = new THREE.Color(`hsl(${hue}deg 74% 56%)`);
+    const color = new THREE.Color(`hsl(${hue}deg 82% 62%)`);
+    const limbColor = color.clone().offsetHSL(0.02, 0, -0.07);
+    const gm = this.toonGradientMap;
 
+    // Visual scale multiplier — meshes are fatter than physics colliders for chunky look
+    const VS = 1.4;
+
+    // Torso
+    const torsoMat = new THREE.MeshToonMaterial({ color, gradientMap: gm });
+    addFresnelRim(torsoMat);
     const torso = new THREE.Mesh(
-      new THREE.CapsuleGeometry(0.43, 0.7, 7, 14),
-      new THREE.MeshStandardMaterial({ color, roughness: 0.55, metalness: 0.08 }),
+      new THREE.CapsuleGeometry(RAGDOLL_TORSO_RADIUS * VS, RAGDOLL_TORSO_HALF_HEIGHT * 2 * VS, 7, 14),
+      torsoMat,
     );
     torso.castShadow = true;
+    torso.receiveShadow = true;
 
+    // Head
+    const headMat = new THREE.MeshToonMaterial({ color: color.clone().offsetHSL(0, 0, 0.16), gradientMap: gm });
+    addFresnelRim(headMat);
     const head = new THREE.Mesh(
-      new THREE.SphereGeometry(0.31, 16, 14),
-      new THREE.MeshStandardMaterial({ color: color.clone().offsetHSL(0, 0, 0.16), roughness: 0.42 }),
+      new THREE.SphereGeometry(RAGDOLL_HEAD_RADIUS * VS, 16, 14),
+      headMat,
     );
-    head.position.y = 0.95;
+    head.castShadow = true;
+    head.receiveShadow = true;
 
-    const leftArm = new THREE.Mesh(
-      new THREE.CapsuleGeometry(0.12, 0.44, 4, 8),
-      new THREE.MeshStandardMaterial({ color: color.clone().offsetHSL(0.02, 0, -0.07), roughness: 0.58 }),
-    );
-    leftArm.position.set(-0.48, 0.25, 0);
-    leftArm.rotation.z = Math.PI / 12;
+    // Arms (upper + lower)
+    const makeArm = (halfLen: number, radius: number) => {
+      const mat = new THREE.MeshToonMaterial({ color: limbColor, gradientMap: gm });
+      addFresnelRim(mat);
+      const mesh = new THREE.Mesh(
+        new THREE.CapsuleGeometry(radius * VS, halfLen * 2 * VS, 4, 8),
+        mat,
+      );
+      mesh.castShadow = true;
+      mesh.receiveShadow = true;
+      return mesh;
+    };
 
-    const rightArm = leftArm.clone();
-    rightArm.position.x = 0.48;
-    rightArm.rotation.z = -Math.PI / 12;
+    const leftArm = makeArm(RAGDOLL_UPPER_ARM_HALF_LENGTH, RAGDOLL_LIMB_RADIUS);
+    const rightArm = makeArm(RAGDOLL_UPPER_ARM_HALF_LENGTH, RAGDOLL_LIMB_RADIUS);
+    const leftForearm = makeArm(RAGDOLL_LOWER_ARM_HALF_LENGTH, RAGDOLL_LIMB_RADIUS * 0.9);
+    const rightForearm = makeArm(RAGDOLL_LOWER_ARM_HALF_LENGTH, RAGDOLL_LIMB_RADIUS * 0.9);
 
+    // Legs (thigh + shin)
+    const makeLeg = (halfLen: number, radius: number) => {
+      const mat = new THREE.MeshToonMaterial({ color: limbColor.clone().offsetHSL(0, 0, -0.05), gradientMap: gm });
+      addFresnelRim(mat);
+      const mesh = new THREE.Mesh(
+        new THREE.CapsuleGeometry(radius * VS, halfLen * 2 * VS, 4, 8),
+        mat,
+      );
+      mesh.castShadow = true;
+      mesh.receiveShadow = true;
+      return mesh;
+    };
+
+    const leftThigh = makeLeg(RAGDOLL_THIGH_HALF_LENGTH, RAGDOLL_LIMB_RADIUS * 1.1);
+    const rightThigh = makeLeg(RAGDOLL_THIGH_HALF_LENGTH, RAGDOLL_LIMB_RADIUS * 1.1);
+    const leftShin = makeLeg(RAGDOLL_SHIN_HALF_LENGTH, RAGDOLL_LIMB_RADIUS * 0.85);
+    const rightShin = makeLeg(RAGDOLL_SHIN_HALF_LENGTH, RAGDOLL_LIMB_RADIUS * 0.85);
+
+    // Emote indicator
     const emote = new THREE.Mesh(
       new THREE.TorusKnotGeometry(0.08, 0.03, 36, 7),
-      new THREE.MeshStandardMaterial({ color: 0xffd166, emissive: 0xff8a00, emissiveIntensity: 0.5 }),
+      new THREE.MeshToonMaterial({ color: 0xffd166, emissive: 0xff8a00, emissiveIntensity: 0.5, gradientMap: gm }),
     );
-    emote.position.set(0, 1.35, 0);
     emote.visible = false;
 
+    // Shadow
     const shadow = this.matteShadow.clone();
     shadow.rotation.x = -Math.PI / 2;
     shadow.position.y = -0.42;
 
     const group = new THREE.Group();
-    group.add(torso, head, leftArm, rightArm, emote, shadow);
+    group.add(torso, head, leftArm, rightArm, leftForearm, rightForearm);
+    group.add(leftThigh, rightThigh, leftShin, rightShin);
+    group.add(emote, shadow);
     this.playerGroup.add(group);
 
-    const visual: PlayerVisual = { group, torso, head, leftArm, rightArm, emote, color };
+    // Map bone names → meshes for ragdoll-driven positioning
+    const boneMeshes = new Map<BoneName, THREE.Mesh>();
+    boneMeshes.set("torso", torso);
+    boneMeshes.set("head", head);
+    boneMeshes.set("l_upper_arm", leftArm);
+    boneMeshes.set("r_upper_arm", rightArm);
+    boneMeshes.set("l_lower_arm", leftForearm);
+    boneMeshes.set("r_lower_arm", rightForearm);
+    boneMeshes.set("l_thigh", leftThigh);
+    boneMeshes.set("r_thigh", rightThigh);
+    boneMeshes.set("l_shin", leftShin);
+    boneMeshes.set("r_shin", rightShin);
+
+    const originalEmissives = new Map<THREE.Mesh, THREE.Color>();
+    for (const mesh of [torso, head, leftArm, rightArm, leftForearm, rightForearm, leftThigh, rightThigh, leftShin, rightShin]) {
+      const mat = mesh.material as THREE.MeshToonMaterial;
+      originalEmissives.set(mesh, mat.emissive.clone());
+    }
+
+    // Try to set up GLTF character model
+    let gltfGroup: THREE.Group | null = null;
+    let gltfBones: Map<BoneName, THREE.Bone> | null = null;
+    let gltfMeshes: THREE.SkinnedMesh[] = [];
+    let mixer: THREE.AnimationMixer | null = null;
+    const animActions = new Map<string, THREE.AnimationAction>();
+
+    if (this.characterLoader.isLoaded()) {
+      const charName = this.characterLoader.pickCharacter(id);
+      const charData = this.characterLoader.cloneCharacter(charName);
+
+      if (charData) {
+        gltfGroup = charData.group;
+        gltfBones = new Map<BoneName, THREE.Bone>();
+        gltfMeshes = charData.skinnedMeshes;
+
+        // Build bone mapping: our BoneName → GLTF Bone
+        for (const [gameBone, kaykitName] of Object.entries(REVERSE_BONE_MAP)) {
+          const bone = charData.bonesByName.get(kaykitName);
+          if (bone) {
+            gltfBones.set(gameBone as BoneName, bone);
+          }
+        }
+
+        // Apply toon materials to GLTF meshes with player color tint
+        const gm = this.toonGradientMap;
+        for (const sm of gltfMeshes) {
+          const oldMat = sm.material as THREE.MeshStandardMaterial;
+          const toonMat = new THREE.MeshToonMaterial({
+            map: oldMat.map,
+            gradientMap: gm,
+            color: color.clone().lerp(new THREE.Color(0xffffff), 0.5),
+          });
+          addFresnelRim(toonMat);
+          sm.material = toonMat;
+          sm.castShadow = true;
+          sm.receiveShadow = true;
+          originalEmissives.set(sm as unknown as THREE.Mesh, toonMat.emissive.clone());
+        }
+
+        // Scale the model to match our ragdoll proportions
+        // KayKit characters are ~1 unit tall; our ragdoll standing height is ~1.3 units
+        gltfGroup.scale.setScalar(1.15);
+
+        // Set up animation mixer
+        mixer = new THREE.AnimationMixer(gltfGroup);
+        const clips = this.characterLoader.getAnimationClips();
+        for (const clip of clips) {
+          const action = mixer.clipAction(clip);
+          animActions.set(clip.name, action);
+        }
+
+        // Start with idle
+        const idleAction = animActions.get(ANIM_MAP.idle);
+        if (idleAction) {
+          idleAction.play();
+        }
+
+        // Add GLTF group to the player group, hide fallback meshes
+        group.add(gltfGroup);
+        for (const mesh of boneMeshes.values()) {
+          mesh.visible = false;
+        }
+      }
+    }
+
+    const visual: PlayerVisual = {
+      group, torso, head, leftArm, rightArm, leftForearm, rightForearm,
+      leftThigh, rightThigh, leftShin, rightShin, emote, color, boneMeshes,
+      flashTimer: 0, originalEmissives,
+      gltfGroup, gltfBones, gltfMeshes, mixer, currentAnim: gltfGroup ? "idle" : null, animActions,
+    };
     this.playerVisuals.set(id, visual);
     return visual;
   }
@@ -503,27 +756,72 @@ class SceneRenderer {
     const existing = this.hazardVisuals.get(hazard.id);
     if (existing) return existing;
 
+    const gm = this.toonGradientMap;
     let geometry: THREE.BufferGeometry;
     let material: THREE.Material;
 
     if (hazard.kind === "moving_crate") {
       geometry = new THREE.BoxGeometry(1.7, 1.1, 1.1);
-      material = new THREE.MeshStandardMaterial({ color: 0xc17738, roughness: 0.65, metalness: 0.2 });
+      material = new THREE.MeshToonMaterial({ color: 0xc17738, gradientMap: gm });
     } else if (hazard.kind === "sweeper") {
       geometry = new THREE.TorusGeometry(0.92, 0.24, 14, 36);
-      material = new THREE.MeshStandardMaterial({ color: 0xff5d73, roughness: 0.44, metalness: 0.2 });
+      material = new THREE.MeshToonMaterial({ color: 0xff5d73, gradientMap: gm });
     } else if (hazard.kind === "conveyor") {
       geometry = new THREE.BoxGeometry(3.1, 0.35, 1.8);
-      material = new THREE.MeshStandardMaterial({ color: 0x78828e, roughness: 0.58, metalness: 0.3 });
+      material = new THREE.MeshToonMaterial({ color: 0x78828e, gradientMap: gm });
     } else {
       geometry = new THREE.CylinderGeometry(1.05, 1.05, 1.55, 20);
-      material = new THREE.MeshStandardMaterial({ color: 0xbc3f3f, roughness: 0.55, metalness: 0.38 });
+      material = new THREE.MeshToonMaterial({ color: 0xbc3f3f, gradientMap: gm });
     }
 
     const mesh = new THREE.Mesh(geometry, material);
+    mesh.castShadow = true;
+    mesh.receiveShadow = true;
     this.hazardGroup.add(mesh);
     this.hazardVisuals.set(hazard.id, mesh);
     return mesh;
+  }
+
+  /** Determine which animation should play based on player state. */
+  private resolveAnimState(player: PlayerStateNet, speed: number): GameAnimState {
+    if (!player.alive) return "death";
+    if (player.stun >= 80) return "hit";
+    if (player.emoteTimer > 0) return "emote";
+    if (player.velocity.y > 3) return "jump_start";
+    if (player.velocity.y < -2 && player.position.y > 0.5) return "jump_idle";
+    if (speed > 5) return "run";
+    if (speed > 0.8) return "walk";
+    return "idle";
+  }
+
+  /** Crossfade from current animation to a new one. */
+  private crossfadeAnim(visual: PlayerVisual, target: GameAnimState): void {
+    if (!visual.mixer) return;
+    const clipName = ANIM_MAP[target];
+    const newAction = visual.animActions.get(clipName);
+    if (!newAction) return;
+
+    // Fade out current
+    if (visual.currentAnim) {
+      const oldClipName = ANIM_MAP[visual.currentAnim];
+      const oldAction = visual.animActions.get(oldClipName);
+      if (oldAction) {
+        oldAction.fadeOut(0.2);
+      }
+    }
+
+    // Fade in new
+    newAction.reset().fadeIn(0.2).play();
+
+    // One-shot animations (attacks, hit, death) should not loop
+    if (target === "hit" || target === "death" || target === "light_attack" || target === "heavy_attack" || target === "grab" || target === "throw") {
+      newAction.setLoop(THREE.LoopOnce, 1);
+      newAction.clampWhenFinished = true;
+    } else {
+      newAction.setLoop(THREE.LoopRepeat, Infinity);
+    }
+
+    visual.currentAnim = target;
   }
 
   renderFrame(params: {
@@ -539,7 +837,7 @@ class SceneRenderer {
     this.setArena(params.arena);
 
     const activePlayerIds = new Set(params.players.map((p) => p.id));
-    this.wobble.prune(activePlayerIds);
+    this.ragdolls.prune(activePlayerIds);
 
     for (const [id, visual] of this.playerVisuals) {
       if (activePlayerIds.has(id)) continue;
@@ -550,30 +848,118 @@ class SceneRenderer {
       const visual = this.ensurePlayerVisual(player.id);
       visual.group.visible = player.alive || player.position.y > -6;
 
-      this.wobble.drive(player.id, player.velocity, player.stun);
-      const wobble = this.wobble.sample(player.id);
+      // Drive the ragdoll physics to follow the capsule controller position
+      const playerSpeed = Math.sqrt(player.velocity.x * player.velocity.x + player.velocity.z * player.velocity.z);
+      const isSprinting = playerSpeed > 8.0;
+      this.ragdolls.driveToPosition(
+        player.id,
+        player.position,
+        player.velocity,
+        player.facingYaw,
+        player.stun,
+        params.dt,
+        isSprinting,
+      );
 
-      visual.group.position.set(player.position.x, player.position.y, player.position.z);
-      visual.group.rotation.y = player.facingYaw;
+      // Read ragdoll bone transforms and apply to visuals
+      const bones = this.ragdolls.getAllBoneTransforms(player.id);
 
-      const pitch = clamp(player.velocity.z * 0.03 + wobble.x * 0.18, -0.5, 0.5);
-      const roll = clamp(-player.velocity.x * 0.03 + wobble.z * 0.18, -0.5, 0.5);
-      visual.torso.rotation.x = pitch;
-      visual.torso.rotation.z = roll;
+      if (visual.gltfGroup && visual.gltfBones && bones) {
+        // ── GLTF mode: position model at torso, drive skeleton from ragdoll ──
+        const torsoT = bones.get("torso");
+        if (torsoT) {
+          // Position the GLTF model root at the ragdoll torso position
+          // The "hips" bone in the GLTF model is the root of the skeleton
+          visual.group.position.set(0, 0, 0);
+          visual.group.rotation.set(0, 0, 0);
+          visual.gltfGroup.position.set(torsoT.x, torsoT.y - 0.55, torsoT.z);
+          visual.gltfGroup.quaternion.set(torsoT.qx, torsoT.qy, torsoT.qz, torsoT.qw);
+        }
 
-      const pulse = Math.sin(params.nowSec * 7 + hashToHue(player.id) * 0.09) * 0.06;
-      visual.head.position.y = 0.95 + pulse + wobble.y * 0.4 + player.stun * 0.0018;
+        // Drive each mapped bone from ragdoll physics transforms
+        // We convert world-space ragdoll positions to model-local positions
+        for (const [boneName, transform] of bones) {
+          const gltfBone = visual.gltfBones.get(boneName);
+          if (!gltfBone || !gltfBone.parent) continue;
 
-      const armSwing = Math.sin(params.nowSec * 9 + player.position.x * 0.3) * 0.38;
-      visual.leftArm.rotation.x = armSwing;
-      visual.rightArm.rotation.x = -armSwing;
+          // Get the parent's world matrix inverse to convert to local space
+          const parentWorldInverse = new THREE.Matrix4();
+          gltfBone.parent.updateWorldMatrix(true, false);
+          parentWorldInverse.copy(gltfBone.parent.matrixWorld).invert();
 
-      if (player.grabbedTargetId) {
-        visual.leftArm.rotation.z = 0.3;
-        visual.rightArm.rotation.z = -0.3;
+          // Target world position from ragdoll
+          const worldPos = new THREE.Vector3(transform.x, transform.y, transform.z);
+          const localPos = worldPos.applyMatrix4(parentWorldInverse);
+
+          // Blend ragdoll influence based on stiffness (more ragdoll = more physics-driven)
+          const ragdollInfluence = 1.0 - (this.ragdolls.getStiffness(player.id) ?? 1.0);
+
+          if (ragdollInfluence > 0.1) {
+            // During hit reactions / knockouts, ragdoll drives bones
+            gltfBone.position.lerp(localPos, ragdollInfluence * 0.5);
+            const worldQuat = new THREE.Quaternion(transform.qx, transform.qy, transform.qz, transform.qw);
+            const parentWorldQuat = new THREE.Quaternion();
+            gltfBone.parent.getWorldQuaternion(parentWorldQuat);
+            const localQuat = parentWorldQuat.invert().multiply(worldQuat);
+            gltfBone.quaternion.slerp(localQuat, ragdollInfluence * 0.4);
+          }
+        }
+
+        // Update animation mixer
+        if (visual.mixer) {
+          // Determine target animation from player state
+          const targetAnim = this.resolveAnimState(player, playerSpeed);
+          if (targetAnim !== visual.currentAnim) {
+            this.crossfadeAnim(visual, targetAnim);
+          }
+          visual.mixer.update(params.dt);
+        }
+
+        // Position emote above head
+        const headT = bones.get("head");
+        if (headT) {
+          visual.emote.position.set(headT.x, headT.y + 0.35, headT.z);
+        }
+
+        // Position shadow below torso
+        if (torsoT) {
+          const shadowChild = visual.group.children.find(
+            (c) => c instanceof THREE.Mesh && c.geometry instanceof THREE.CircleGeometry,
+          );
+          if (shadowChild) {
+            shadowChild.position.set(torsoT.x, 0.02, torsoT.z);
+          }
+        }
+      } else if (bones) {
+        // ── Fallback capsule mode ──
+        visual.group.position.set(0, 0, 0);
+        visual.group.rotation.set(0, 0, 0);
+
+        for (const [boneName, transform] of bones) {
+          const mesh = visual.boneMeshes.get(boneName);
+          if (!mesh) continue;
+          mesh.position.set(transform.x, transform.y, transform.z);
+          mesh.quaternion.set(transform.qx, transform.qy, transform.qz, transform.qw);
+        }
+
+        const headTransform = bones.get("head");
+        if (headTransform) {
+          visual.emote.position.set(headTransform.x, headTransform.y + 0.35, headTransform.z);
+        }
+
+        const torsoTransform = bones.get("torso");
+        if (torsoTransform) {
+          const shadowChild = visual.group.children.find(
+            (c) => c instanceof THREE.Mesh && c.geometry instanceof THREE.CircleGeometry,
+          );
+          if (shadowChild) {
+            shadowChild.position.set(torsoTransform.x, 0.02, torsoTransform.z);
+          }
+        }
       } else {
-        visual.leftArm.rotation.z = Math.PI / 12;
-        visual.rightArm.rotation.z = -Math.PI / 12;
+        // Before ragdoll is created
+        visual.group.position.set(player.position.x, player.position.y, player.position.z);
+        visual.group.rotation.y = player.facingYaw;
       }
 
       visual.emote.visible = player.emoteTimer > 0;
@@ -582,14 +968,49 @@ class SceneRenderer {
         visual.emote.rotation.y += params.dt * 6;
       }
 
-      if (player.id === params.localPlayerId) {
-        (visual.torso.material as THREE.MeshStandardMaterial).emissive.setHex(0x183f53);
-        (visual.torso.material as THREE.MeshStandardMaterial).emissiveIntensity = 0.35;
+      // Local player highlight
+      if (visual.gltfMeshes.length > 0) {
+        for (const sm of visual.gltfMeshes) {
+          const mat = sm.material as THREE.MeshToonMaterial;
+          if (player.id === params.localPlayerId) {
+            mat.emissive.setHex(0x183f53);
+            mat.emissiveIntensity = 0.35;
+          } else {
+            mat.emissive.setHex(0x000000);
+            mat.emissiveIntensity = 0;
+          }
+        }
       } else {
-        (visual.torso.material as THREE.MeshStandardMaterial).emissive.setHex(0x000000);
-        (visual.torso.material as THREE.MeshStandardMaterial).emissiveIntensity = 0;
+        if (player.id === params.localPlayerId) {
+          (visual.torso.material as THREE.MeshToonMaterial).emissive.setHex(0x183f53);
+          (visual.torso.material as THREE.MeshToonMaterial).emissiveIntensity = 0.35;
+        } else {
+          (visual.torso.material as THREE.MeshToonMaterial).emissive.setHex(0x000000);
+          (visual.torso.material as THREE.MeshToonMaterial).emissiveIntensity = 0;
+        }
+      }
+
+      // Hit flash effect
+      if (visual.flashTimer > 0) {
+        visual.flashTimer -= params.dt;
+        const flashIntensity = Math.max(0, visual.flashTimer / 0.15);
+        for (const [mesh, origEmissive] of visual.originalEmissives) {
+          const mat = mesh.material as THREE.MeshToonMaterial;
+          mat.emissive.lerpColors(origEmissive, new THREE.Color(0xfff8e0), flashIntensity);
+          mat.emissiveIntensity = flashIntensity * 1.5;
+        }
+      } else {
+        for (const [mesh, origEmissive] of visual.originalEmissives) {
+          if (mesh === visual.torso && player.id === params.localPlayerId) continue;
+          const mat = mesh.material as THREE.MeshToonMaterial;
+          mat.emissive.copy(origEmissive);
+          mat.emissiveIntensity = 0;
+        }
       }
     }
+
+    // Step ragdoll physics
+    this.ragdolls.step(params.dt);
 
     const activeHazards = new Set(params.hazards.map((h) => h.id));
     for (const [id, mesh] of this.hazardVisuals) {
@@ -613,15 +1034,40 @@ class SceneRenderer {
       }
     }
 
+    // Landing dust detection
+    for (const player of params.players) {
+      const wasAirborne = this.airborneState.get(player.id) ?? false;
+      const isAirborne = player.velocity.y < -2 || player.position.y > 0.3;
+      this.airborneState.set(player.id, isAirborne);
+      if (wasAirborne && !isAirborne) {
+        // Just landed — spawn dust
+        this.particles.burst(
+          { x: player.position.x, y: 0.05, z: player.position.z },
+          8, 2.5, 0xc4a66a, 0.35,
+        );
+      }
+    }
+
+    // Update particle system
+    this.particles.update(params.dt);
+
     const local = params.localPlayerId ? params.players.find((p) => p.id === params.localPlayerId) : null;
-    const target = local ? new THREE.Vector3(local.position.x, local.position.y + 2.8, local.position.z) : new THREE.Vector3(0, 0, 0);
-    const desiredCamera = target.clone().add(new THREE.Vector3(0, 12.5, 16.5));
+    const target = local ? new THREE.Vector3(local.position.x, local.position.y + 1.8, local.position.z) : new THREE.Vector3(0, 0, 0);
+    const desiredCamera = target.clone().add(new THREE.Vector3(0, 8, 11));
 
     this.camera.position.lerp(desiredCamera, 0.11);
     this.camera.lookAt(target.x, target.y, target.z);
 
-    this.wobble.step(params.dt);
-    this.renderer.render(this.scene, this.camera);
+    // Apply camera shake
+    if (this.shakeIntensity > 0.01) {
+      const shakeX = (Math.random() - 0.5) * this.shakeIntensity * 0.4;
+      const shakeY = (Math.random() - 0.5) * this.shakeIntensity * 0.3;
+      this.camera.position.x += shakeX;
+      this.camera.position.y += shakeY;
+      this.shakeIntensity = Math.max(0, this.shakeIntensity - this.shakeDecay * params.dt);
+    }
+
+    this.composer.render();
   }
 }
 
@@ -659,7 +1105,7 @@ class RuckusGame {
 
   private readonly input: InputController;
   private readonly audio = new AudioBank();
-  private readonly wobble = new WobbleSimulator();
+  private readonly ragdolls = new RagdollManager();
   private readonly renderer: SceneRenderer;
 
   private client = new ColyseusClient(SERVER_URL);
@@ -695,7 +1141,7 @@ class RuckusGame {
   constructor() {
     this.canvas.tabIndex = 0;
     this.input = new InputController(this.canvas);
-    this.renderer = new SceneRenderer(this.canvas, this.wobble);
+    this.renderer = new SceneRenderer(this.canvas, this.ragdolls);
 
     this.bindUI();
     this.installDebugHooks();
@@ -996,24 +1442,97 @@ class RuckusGame {
         text = `Match winner: ${event.actorId ?? "None"}. Vote rematch to play again.`;
         this.rematchButton.textContent = "Vote Rematch";
         break;
-      case "hit":
-        this.audio.play("hit");
-        text = `${event.actorId ?? "?"} hit ${event.targetId ?? "?"}`;
+      case "hit": {
+        const isHeavy = event.message === "heavy";
+        this.audio.play(isHeavy ? "heavy" : "hit");
+        text = `${event.actorId ?? "?"} ${isHeavy ? "heavy hit" : "hit"} ${event.targetId ?? "?"}`;
+        // Camera shake — stronger for heavy attacks, only when local player involved
+        if (event.targetId === this.localPlayerId || event.actorId === this.localPlayerId) {
+          this.renderer.addCameraShake(isHeavy ? 0.4 : 0.15);
+        } else {
+          this.renderer.addCameraShake(isHeavy ? 0.08 : 0.03);
+        }
+        // Trigger attack pose on the attacker
+        if (event.actorId) {
+          this.ragdolls.triggerAttackPose(event.actorId, isHeavy ? "heavy" : "light");
+          this.renderer.triggerAttackAnim(event.actorId, isHeavy ? "heavy" : "light");
+        }
+        // Flash the victim and spawn hit VFX
+        if (event.targetId) {
+          this.renderer.flashPlayer(event.targetId);
+          this.renderer.spawnHitVFX(event.targetId, isHeavy);
+        }
+        // Apply ragdoll hit impulse with direction from attacker to target
+        if (event.targetId && event.actorId) {
+          const target = this.latestSnapshot?.players.find((p) => p.id === event.targetId);
+          const actor = this.latestSnapshot?.players.find((p) => p.id === event.actorId);
+          if (target && actor) {
+            const dx = target.position.x - actor.position.x;
+            const dz = target.position.z - actor.position.z;
+            const dist = Math.max(0.1, Math.hypot(dx, dz));
+            const magnitude = isHeavy ? 14 : 8;
+            this.ragdolls.applyHitImpulse(
+              event.targetId,
+              { x: dx / dist, y: 0.5, z: dz / dist },
+              magnitude,
+              isHeavy,
+            );
+          }
+        }
         break;
+      }
       case "hazard_hit":
         this.audio.play("heavy");
         text = `${event.targetId ?? "?"} was slammed by a hazard`;
+        if (event.targetId) {
+          // Hazard hits are always heavy
+          this.ragdolls.applyHitImpulse(event.targetId, { x: 0, y: 1, z: 0 }, 15, true);
+        }
+        // Camera shake for hazard hits
+        this.renderer.addCameraShake(event.targetId === this.localPlayerId ? 0.5 : 0.1);
         break;
       case "knockout":
         this.audio.play("knockout");
         text = `${event.targetId ?? "?"} knocked out (${event.message ?? "impact"})`;
+        if (event.targetId) {
+          this.ragdolls.setKnockout(event.targetId);
+          this.renderer.spawnKnockoutVFX(event.targetId);
+        }
+        // Big camera shake on knockout
+        this.renderer.addCameraShake(event.targetId === this.localPlayerId ? 0.7 : 0.2);
         break;
       case "grab":
+        this.audio.play("grab");
         text = `${event.actorId ?? "?"} grabbed ${event.targetId ?? "?"}`;
+        // Create physics grab joint between grabber and target ragdolls
+        if (event.actorId && event.targetId) {
+          this.ragdolls.createGrabJoint(event.actorId, event.targetId);
+          this.renderer.spawnGrabVFX(event.actorId);
+        }
         break;
-      case "release":
+      case "release": {
+        this.audio.play("throw");
         text = `${event.actorId ?? "?"} released ${event.targetId ?? "?"}`;
+        // Release grab joint and apply throw impulse
+        if (event.actorId && event.targetId) {
+          const actor = this.latestSnapshot?.players.find((p) => p.id === event.actorId);
+          const target = this.latestSnapshot?.players.find((p) => p.id === event.targetId);
+          if (actor && target) {
+            // Throw direction is from grabber toward target
+            const dx = target.position.x - actor.position.x;
+            const dz = target.position.z - actor.position.z;
+            const dist = Math.max(0.1, Math.hypot(dx, dz));
+            this.ragdolls.releaseGrabJoint(event.actorId, true, {
+              x: dx / dist,
+              y: 0.4,
+              z: dz / dist,
+            });
+          } else {
+            this.ragdolls.releaseGrabJoint(event.actorId, true);
+          }
+        }
         break;
+      }
     }
 
     this.pushEvent(text);
