@@ -94,6 +94,8 @@ interface PlayerVisual {
   mixer: THREE.AnimationMixer | null;
   currentAnim: GameAnimState | null;
   animActions: Map<string, THREE.AnimationAction>;
+  oneShotTimer: number;
+  displayYaw: number;
 }
 
 const hashToHue = (value: string) => {
@@ -103,6 +105,14 @@ const hashToHue = (value: string) => {
   }
   return hash % 360;
 };
+
+// Pre-allocated temp objects to avoid per-frame GC pressure
+const _tmpMat4 = new THREE.Matrix4();
+const _tmpVec3A = new THREE.Vector3();
+const _tmpVec3B = new THREE.Vector3();
+const _tmpQuatA = new THREE.Quaternion();
+const _tmpQuatB = new THREE.Quaternion();
+const _hitFlashColor = new THREE.Color(0xfff8e0);
 
 /** Creates a 4-band gradient texture for cel-shading */
 function createToonGradientMap(): THREE.DataTexture {
@@ -458,6 +468,21 @@ class SceneRenderer {
     if (!visual?.mixer) return;
     const animState: GameAnimState = type === "heavy" ? "heavy_attack" : "light_attack";
     this.crossfadeAnim(visual, animState);
+    visual.oneShotTimer = type === "heavy" ? 0.5 : 0.3;
+  }
+
+  triggerGrabAnim(playerId: string): void {
+    const visual = this.playerVisuals.get(playerId);
+    if (!visual?.mixer) return;
+    this.crossfadeAnim(visual, "grab");
+    visual.oneShotTimer = 0.6;
+  }
+
+  triggerThrowAnim(playerId: string): void {
+    const visual = this.playerVisuals.get(playerId);
+    if (!visual?.mixer) return;
+    this.crossfadeAnim(visual, "throw");
+    visual.oneShotTimer = 0.5;
   }
 
   /** Spawn grab VFX — blue particles at hand. */
@@ -747,6 +772,7 @@ class SceneRenderer {
       leftThigh, rightThigh, leftShin, rightShin, emote, color, boneMeshes,
       flashTimer: 0, originalEmissives,
       gltfGroup, gltfBones, gltfMeshes, mixer, currentAnim: gltfGroup ? "idle" : null, animActions,
+      oneShotTimer: 0, displayYaw: NaN,
     };
     this.playerVisuals.set(id, visual);
     return visual;
@@ -785,6 +811,7 @@ class SceneRenderer {
   /** Determine which animation should play based on player state. */
   private resolveAnimState(player: PlayerStateNet, speed: number): GameAnimState {
     if (!player.alive) return "death";
+    if (player.knockedOut) return "hit";
     if (player.stun >= 80) return "hit";
     if (player.emoteTimer > 0) return "emote";
     if (player.velocity.y > 3) return "jump_start";
@@ -814,7 +841,7 @@ class SceneRenderer {
     newAction.reset().fadeIn(0.2).play();
 
     // One-shot animations (attacks, hit, death) should not loop
-    if (target === "hit" || target === "death" || target === "light_attack" || target === "heavy_attack" || target === "grab" || target === "throw") {
+    if (target === "hit" || target === "death" || target === "light_attack" || target === "heavy_attack" || target === "grab" || target === "throw" || target === "jump_land") {
       newAction.setLoop(THREE.LoopOnce, 1);
       newAction.clampWhenFinished = true;
     } else {
@@ -865,54 +892,96 @@ class SceneRenderer {
       const bones = this.ragdolls.getAllBoneTransforms(player.id);
 
       if (visual.gltfGroup && visual.gltfBones && bones) {
-        // ── GLTF mode: position model at torso, drive skeleton from ragdoll ──
+        // ── GLTF mode: Animation-driven active ragdoll (Gang Beasts style) ──
+        // 1. Position model at ragdoll torso for animation target computation
+        // 2. Run animation mixer → bones get animation pose
+        // 3. Read animation bone world positions → feed to ragdoll as PD targets
+        // 4. Ragdoll physics drives bones toward animation targets
+        // 5. Read ragdoll transforms → write to GLTF bones (ragdoll IS the visual)
+
         const torsoT = bones.get("torso");
         if (torsoT) {
-          // Position the GLTF model root at the ragdoll torso position
-          // The "hips" bone in the GLTF model is the root of the skeleton
           visual.group.position.set(0, 0, 0);
           visual.group.rotation.set(0, 0, 0);
+
+          // Position GLTF group at ragdoll torso position
           visual.gltfGroup.position.set(torsoT.x, torsoT.y - 0.55, torsoT.z);
-          visual.gltfGroup.quaternion.set(torsoT.qx, torsoT.qy, torsoT.qz, torsoT.qw);
+          if (isNaN(visual.displayYaw)) {
+            visual.displayYaw = player.facingYaw;
+          } else {
+            visual.displayYaw = lerpAngle(visual.displayYaw, player.facingYaw, 0.15);
+          }
+          visual.gltfGroup.rotation.set(0, visual.displayYaw, 0);
         }
 
-        // Drive each mapped bone from ragdoll physics transforms
-        // We convert world-space ragdoll positions to model-local positions
+        // Detect landing for jump_land animation
+        const wasAirborne = this.airborneState.get(player.id) ?? false;
+        const isNowAirborne = player.velocity.y < -2 || player.position.y > 0.3;
+
+        // Update animation mixer (this sets bone local transforms to animation pose)
+        if (visual.mixer) {
+          if (wasAirborne && !isNowAirborne && visual.oneShotTimer <= 0) {
+            this.crossfadeAnim(visual, "jump_land");
+            visual.oneShotTimer = 0.35;
+          }
+
+          if (visual.oneShotTimer > 0) {
+            visual.oneShotTimer -= params.dt;
+          } else {
+            const targetAnim = this.resolveAnimState(player, playerSpeed);
+            if (targetAnim !== visual.currentAnim) {
+              this.crossfadeAnim(visual, targetAnim);
+            }
+          }
+          visual.mixer.update(params.dt);
+        }
+
+        // Read animation bone world positions and local quaternions
+        // (AFTER mixer update, BEFORE ragdoll overwrite)
+        const animPositions = new Map<BoneName, { x: number; y: number; z: number }>();
+        const animQuaternions = new Map<BoneName, { x: number; y: number; z: number; w: number }>();
+
+        for (const [boneName, gltfBone] of visual.gltfBones) {
+          // Update world matrix to get accurate world position
+          gltfBone.updateWorldMatrix(true, false);
+          _tmpVec3A.setFromMatrixPosition(gltfBone.matrixWorld);
+          animPositions.set(boneName, { x: _tmpVec3A.x, y: _tmpVec3A.y, z: _tmpVec3A.z });
+
+          // Read local quaternion (animation-driven rotation)
+          animQuaternions.set(boneName, {
+            x: gltfBone.quaternion.x,
+            y: gltfBone.quaternion.y,
+            z: gltfBone.quaternion.z,
+            w: gltfBone.quaternion.w,
+          });
+        }
+
+        // Feed animation targets to ragdoll PD system
+        this.ragdolls.setAnimationTargets(player.id, animPositions, animQuaternions);
+
+        // Now drive GLTF bones from ragdoll physics (ragdoll IS the visual)
+        const ragdollInfluence = 1.0 - (this.ragdolls.getStiffness(player.id) ?? 1.0);
+        // Always blend ragdoll into GLTF bones, but with varying strength
+        // Normal gameplay: low influence (0.25) gives subtle physics feel
+        // Hit/knockout: high influence (0.6-1.0) gives full ragdoll deformation
+        const blendPosition = Math.max(0.15, ragdollInfluence * 0.6);
+        const blendRotation = Math.max(0.1, ragdollInfluence * 0.5);
+
         for (const [boneName, transform] of bones) {
           const gltfBone = visual.gltfBones.get(boneName);
           if (!gltfBone || !gltfBone.parent) continue;
 
-          // Get the parent's world matrix inverse to convert to local space
-          const parentWorldInverse = new THREE.Matrix4();
           gltfBone.parent.updateWorldMatrix(true, false);
-          parentWorldInverse.copy(gltfBone.parent.matrixWorld).invert();
+          _tmpMat4.copy(gltfBone.parent.matrixWorld).invert();
 
-          // Target world position from ragdoll
-          const worldPos = new THREE.Vector3(transform.x, transform.y, transform.z);
-          const localPos = worldPos.applyMatrix4(parentWorldInverse);
+          _tmpVec3A.set(transform.x, transform.y, transform.z);
+          const localPos = _tmpVec3A.applyMatrix4(_tmpMat4);
 
-          // Blend ragdoll influence based on stiffness (more ragdoll = more physics-driven)
-          const ragdollInfluence = 1.0 - (this.ragdolls.getStiffness(player.id) ?? 1.0);
-
-          if (ragdollInfluence > 0.1) {
-            // During hit reactions / knockouts, ragdoll drives bones
-            gltfBone.position.lerp(localPos, ragdollInfluence * 0.5);
-            const worldQuat = new THREE.Quaternion(transform.qx, transform.qy, transform.qz, transform.qw);
-            const parentWorldQuat = new THREE.Quaternion();
-            gltfBone.parent.getWorldQuaternion(parentWorldQuat);
-            const localQuat = parentWorldQuat.invert().multiply(worldQuat);
-            gltfBone.quaternion.slerp(localQuat, ragdollInfluence * 0.4);
-          }
-        }
-
-        // Update animation mixer
-        if (visual.mixer) {
-          // Determine target animation from player state
-          const targetAnim = this.resolveAnimState(player, playerSpeed);
-          if (targetAnim !== visual.currentAnim) {
-            this.crossfadeAnim(visual, targetAnim);
-          }
-          visual.mixer.update(params.dt);
+          gltfBone.position.lerp(localPos, blendPosition);
+          _tmpQuatA.set(transform.qx, transform.qy, transform.qz, transform.qw);
+          gltfBone.parent.getWorldQuaternion(_tmpQuatB);
+          _tmpQuatB.invert().multiply(_tmpQuatA);
+          gltfBone.quaternion.slerp(_tmpQuatB, blendRotation);
         }
 
         // Position emote above head
@@ -959,7 +1028,12 @@ class SceneRenderer {
       } else {
         // Before ragdoll is created
         visual.group.position.set(player.position.x, player.position.y, player.position.z);
-        visual.group.rotation.y = player.facingYaw;
+        if (isNaN(visual.displayYaw)) {
+          visual.displayYaw = player.facingYaw;
+        } else {
+          visual.displayYaw = lerpAngle(visual.displayYaw, player.facingYaw, 0.15);
+        }
+        visual.group.rotation.y = visual.displayYaw;
       }
 
       visual.emote.visible = player.emoteTimer > 0;
@@ -996,7 +1070,7 @@ class SceneRenderer {
         const flashIntensity = Math.max(0, visual.flashTimer / 0.15);
         for (const [mesh, origEmissive] of visual.originalEmissives) {
           const mat = mesh.material as THREE.MeshToonMaterial;
-          mat.emissive.lerpColors(origEmissive, new THREE.Color(0xfff8e0), flashIntensity);
+          mat.emissive.lerpColors(origEmissive, _hitFlashColor, flashIntensity);
           mat.emissiveIntensity = flashIntensity * 1.5;
         }
       } else {
@@ -1052,11 +1126,20 @@ class SceneRenderer {
     this.particles.update(params.dt);
 
     const local = params.localPlayerId ? params.players.find((p) => p.id === params.localPlayerId) : null;
-    const target = local ? new THREE.Vector3(local.position.x, local.position.y + 1.8, local.position.z) : new THREE.Vector3(0, 0, 0);
-    const desiredCamera = target.clone().add(new THREE.Vector3(0, 8, 11));
+    // Spectator camera: if local player is dead, follow the first alive player
+    let cameraTarget = local;
+    if (local && !local.alive) {
+      cameraTarget = params.players.find((p) => p.alive) ?? local;
+    }
+    if (cameraTarget) {
+      _tmpVec3A.set(cameraTarget.position.x, cameraTarget.position.y + 1.8, cameraTarget.position.z);
+    } else {
+      _tmpVec3A.set(0, 0, 0);
+    }
+    _tmpVec3B.set(_tmpVec3A.x, _tmpVec3A.y + 8, _tmpVec3A.z + 11);
 
-    this.camera.position.lerp(desiredCamera, 0.11);
-    this.camera.lookAt(target.x, target.y, target.z);
+    this.camera.position.lerp(_tmpVec3B, 0.11);
+    this.camera.lookAt(_tmpVec3A.x, _tmpVec3A.y, _tmpVec3A.z);
 
     // Apply camera shake
     if (this.shakeIntensity > 0.01) {
@@ -1103,6 +1186,11 @@ class RuckusGame {
 
   private readonly eventFeed = document.querySelector<HTMLElement>("#event-feed")!;
 
+  private readonly roundEndOverlay = document.querySelector<HTMLElement>("#round-end-overlay")!;
+  private readonly roundEndTitle = document.querySelector<HTMLElement>("#round-end-title")!;
+  private readonly roundEndPlayers = document.querySelector<HTMLElement>("#round-end-players")!;
+  private readonly roundEndSubtitle = document.querySelector<HTMLElement>("#round-end-subtitle")!;
+
   private readonly input: InputController;
   private readonly audio = new AudioBank();
   private readonly ragdolls = new RagdollManager();
@@ -1126,6 +1214,14 @@ class RuckusGame {
   private rafLastMs = performance.now();
   private simulationNowMs = performance.now();
   private inputAccumulator = 0;
+
+  // Client-side cooldowns for triggering local attack/grab animations
+  private localLightCooldown = 0;
+  private localHeavyCooldown = 0;
+  private localGrabCooldown = 0;
+
+  /** Previous scoreboard (wins per player id) — used for score count-up animation */
+  private previousWins = new Map<string, number>();
 
   private readonly loop = (ts: number) => {
     const dt = Math.min(0.05, (ts - this.rafLastMs) / 1000);
@@ -1434,18 +1530,21 @@ class RuckusGame {
         text = `Round started on ${ARENA_LABELS[(event.message as ArenaId) ?? "cargo_rooftop"]}`;
         this.audio.play("round");
         this.rematchButton.textContent = "Vote Rematch";
+        this.hideRoundEndOverlay();
         break;
       case "round_end":
-        text = `Round ended. Winner: ${event.actorId ?? "None"}`;
+        text = `Round ended. Winner: ${this.resolvePlayerName(event.actorId)}`;
+        this.showRoundEndOverlay(event.actorId);
         break;
       case "match_end":
-        text = `Match winner: ${event.actorId ?? "None"}. Vote rematch to play again.`;
+        text = `Match winner: ${this.resolvePlayerName(event.actorId)}. Vote rematch to play again.`;
         this.rematchButton.textContent = "Vote Rematch";
+        this.showRoundEndOverlay(event.actorId, true);
         break;
       case "hit": {
         const isHeavy = event.message === "heavy";
         this.audio.play(isHeavy ? "heavy" : "hit");
-        text = `${event.actorId ?? "?"} ${isHeavy ? "heavy hit" : "hit"} ${event.targetId ?? "?"}`;
+        text = `${this.resolvePlayerName(event.actorId)} ${isHeavy ? "heavy hit" : "hit"} ${this.resolvePlayerName(event.targetId)}`;
         // Camera shake — stronger for heavy attacks, only when local player involved
         if (event.targetId === this.localPlayerId || event.actorId === this.localPlayerId) {
           this.renderer.addCameraShake(isHeavy ? 0.4 : 0.15);
@@ -1455,7 +1554,10 @@ class RuckusGame {
         // Trigger attack pose on the attacker
         if (event.actorId) {
           this.ragdolls.triggerAttackPose(event.actorId, isHeavy ? "heavy" : "light");
-          this.renderer.triggerAttackAnim(event.actorId, isHeavy ? "heavy" : "light");
+          // Skip attack anim for local player — already triggered on input
+          if (event.actorId !== this.localPlayerId) {
+            this.renderer.triggerAttackAnim(event.actorId, isHeavy ? "heavy" : "light");
+          }
         }
         // Flash the victim and spawn hit VFX
         if (event.targetId) {
@@ -1483,7 +1585,7 @@ class RuckusGame {
       }
       case "hazard_hit":
         this.audio.play("heavy");
-        text = `${event.targetId ?? "?"} was slammed by a hazard`;
+        text = `${this.resolvePlayerName(event.targetId)} was slammed by a hazard`;
         if (event.targetId) {
           // Hazard hits are always heavy
           this.ragdolls.applyHitImpulse(event.targetId, { x: 0, y: 1, z: 0 }, 15, true);
@@ -1493,7 +1595,7 @@ class RuckusGame {
         break;
       case "knockout":
         this.audio.play("knockout");
-        text = `${event.targetId ?? "?"} knocked out (${event.message ?? "impact"})`;
+        text = `${this.resolvePlayerName(event.targetId)} knocked out (${event.message ?? "impact"})`;
         if (event.targetId) {
           this.ragdolls.setKnockout(event.targetId);
           this.renderer.spawnKnockoutVFX(event.targetId);
@@ -1503,16 +1605,20 @@ class RuckusGame {
         break;
       case "grab":
         this.audio.play("grab");
-        text = `${event.actorId ?? "?"} grabbed ${event.targetId ?? "?"}`;
+        text = `${this.resolvePlayerName(event.actorId)} grabbed ${this.resolvePlayerName(event.targetId)}`;
         // Create physics grab joint between grabber and target ragdolls
         if (event.actorId && event.targetId) {
           this.ragdolls.createGrabJoint(event.actorId, event.targetId);
           this.renderer.spawnGrabVFX(event.actorId);
+          // Skip grab anim for local player — already triggered on input
+          if (event.actorId !== this.localPlayerId) {
+            this.renderer.triggerGrabAnim(event.actorId);
+          }
         }
         break;
       case "release": {
         this.audio.play("throw");
-        text = `${event.actorId ?? "?"} released ${event.targetId ?? "?"}`;
+        text = `${this.resolvePlayerName(event.actorId)} released ${this.resolvePlayerName(event.targetId)}`;
         // Release grab joint and apply throw impulse
         if (event.actorId && event.targetId) {
           const actor = this.latestSnapshot?.players.find((p) => p.id === event.actorId);
@@ -1531,11 +1637,117 @@ class RuckusGame {
             this.ragdolls.releaseGrabJoint(event.actorId, true);
           }
         }
+        if (event.actorId) {
+          this.renderer.triggerThrowAnim(event.actorId);
+        }
         break;
       }
     }
 
     this.pushEvent(text);
+  }
+
+  private resolvePlayerName(id: string | undefined): string {
+    if (!id) return "?";
+    const player = this.latestSnapshot?.players.find((p) => p.id === id);
+    return player?.name ?? id;
+  }
+
+  private showRoundEndOverlay(winnerId?: string, isMatchEnd = false): void {
+    if (!this.latestSnapshot) return;
+
+    this.roundEndTitle.textContent = isMatchEnd ? "Match Winner!" : "Round Over!";
+
+    // Sort by wins descending, winner card first
+    const players = [...this.latestSnapshot.players].sort((a, b) => {
+      if (a.id === winnerId) return -1;
+      if (b.id === winnerId) return 1;
+      return b.wins - a.wins;
+    });
+    this.roundEndPlayers.innerHTML = "";
+
+    let cardIndex = 0;
+    for (const player of players) {
+      const isWinner = player.id === winnerId;
+      const card = document.createElement("div");
+      card.className = "re-player" + (isWinner ? " winner" : "");
+
+      // Staggered entrance delay
+      const delay = isWinner ? 0 : 150 + cardIndex * 100;
+      card.style.animationDelay = `${delay}ms`;
+
+      // Crown on winner
+      if (isWinner) {
+        const crown = document.createElement("div");
+        crown.className = "re-crown";
+        crown.textContent = "\u{1F451}";
+        card.appendChild(crown);
+      }
+
+      const hue = hashToHue(player.id);
+      const avatar = document.createElement("div");
+      avatar.className = "re-avatar";
+      avatar.style.background = `hsl(${hue}deg 82% 62%)`;
+      avatar.textContent = player.name.charAt(0).toUpperCase();
+
+      const name = document.createElement("div");
+      name.className = "re-name";
+      name.textContent = player.name;
+
+      const score = document.createElement("div");
+      score.className = "re-score";
+
+      // Score count-up animation for the winner
+      const prevWins = this.previousWins.get(player.id) ?? 0;
+      const newWins = player.wins;
+
+      if (isWinner && newWins > prevWins) {
+        score.textContent = String(prevWins);
+        const countUpDelay = 400;
+        const countUpDuration = 600;
+        const steps = newWins - prevWins;
+        const stepInterval = countUpDuration / steps;
+
+        setTimeout(() => {
+          let current = prevWins;
+          const interval = setInterval(() => {
+            current++;
+            score.textContent = String(current);
+            score.classList.remove("pop");
+            // Force reflow to restart animation
+            void score.offsetWidth;
+            score.classList.add("pop");
+            if (current >= newWins) {
+              clearInterval(interval);
+            }
+          }, stepInterval);
+        }, countUpDelay);
+      } else {
+        score.textContent = String(newWins);
+      }
+
+      card.appendChild(avatar);
+      card.appendChild(name);
+      card.appendChild(score);
+      this.roundEndPlayers.appendChild(card);
+
+      if (!isWinner) cardIndex++;
+    }
+
+    // Save current wins for next round's count-up
+    for (const player of this.latestSnapshot.players) {
+      this.previousWins.set(player.id, player.wins);
+    }
+
+    this.roundEndSubtitle.textContent = isMatchEnd
+      ? "Vote rematch to play again!"
+      : "Next round starting soon...";
+
+    this.roundEndOverlay.classList.remove("hidden");
+  }
+
+  private hideRoundEndOverlay(): void {
+    this.roundEndOverlay.classList.add("hidden");
   }
 
   private pushEvent(text: string): void {
@@ -1570,7 +1782,11 @@ class RuckusGame {
     this.hudRoom.textContent = `Room: ${this.latestRoomCode}`;
     this.hudMode.textContent = `Mode: ${MODE_LABELS[round.mode]}`;
     this.hudRound.textContent = `Round: ${round.roundNumber}/${round.maxRounds} (${round.phase})`;
-    this.hudTimer.textContent = `Time: ${round.roundTimeLeft.toFixed(1)}s${round.suddenDeath ? " - Sudden Death" : ""}`;
+    const localAlive = this.localPlayerId
+      ? snapshot.players.find((p) => p.id === this.localPlayerId)?.alive ?? true
+      : true;
+    const spectating = round.phase === "active" && !localAlive;
+    this.hudTimer.textContent = `Time: ${round.roundTimeLeft.toFixed(1)}s${round.suddenDeath ? " - Sudden Death" : ""}${spectating ? " - SPECTATING" : ""}`;
     this.hudArena.textContent = `Arena: ${ARENA_LABELS[round.arena]}`;
 
     const score = snapshot.players
@@ -1594,10 +1810,32 @@ class RuckusGame {
     if (!this.room || !this.latestSnapshot || !this.localPlayerId) return;
     if (this.latestSnapshot.roundState.phase !== "active") return;
 
+    // Dead/knocked-out player input suppression — no inputs sent when eliminated or KO'd
+    const localPlayer = this.latestSnapshot.players.find((p) => p.id === this.localPlayerId);
+    if (localPlayer && (!localPlayer.alive || localPlayer.knockedOut)) return;
+
     this.localTick = Math.max(this.localTick, this.latestSnapshot.serverTick) + 1;
     const input = this.input.sample(this.localTick);
     if (!this.safeSend("player_input", input)) return;
     this.pendingInputs.push(input);
+
+    // Trigger local attack/grab animations on key press (independent of server hit confirmation)
+    this.localLightCooldown = Math.max(0, this.localLightCooldown - dt);
+    this.localHeavyCooldown = Math.max(0, this.localHeavyCooldown - dt);
+    this.localGrabCooldown = Math.max(0, this.localGrabCooldown - dt);
+
+    if (this.localPlayerId) {
+      if (input.lightAttack && this.localLightCooldown <= 0) {
+        this.renderer.triggerAttackAnim(this.localPlayerId, "light");
+        this.localLightCooldown = 0.45;
+      } else if (input.heavyAttack && this.localHeavyCooldown <= 0) {
+        this.renderer.triggerAttackAnim(this.localPlayerId, "heavy");
+        this.localHeavyCooldown = 0.95;
+      } else if (input.grab && this.localGrabCooldown <= 0) {
+        this.renderer.triggerGrabAnim(this.localPlayerId);
+        this.localGrabCooldown = 0.6;
+      }
+    }
 
     if (this.pendingInputs.length > SERVER_TICK_RATE * 3) {
       this.pendingInputs.shift();

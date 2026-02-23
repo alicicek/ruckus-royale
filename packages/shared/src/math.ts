@@ -1,12 +1,14 @@
 import {
   DRAG_AIR,
   DRAG_GROUND,
+  EXTRA_GRAVITY_FALLING,
   GRAVITY,
   JUMP_VELOCITY,
   MAX_FALL_SPEED,
   MOVE_SPEED,
   PLAYER_RADIUS,
   SPRINT_MULTIPLIER,
+  TURN_SPEED_RAD,
 } from "./constants";
 import type { ArenaId, InputFrame, Vector3Net } from "./types";
 
@@ -111,6 +113,10 @@ export function integrateMotion(state: MotionState, input: InputFrame, dt: numbe
   }
 
   state.velocity.y += GRAVITY * dt;
+  // Extra falling gravity for heavier descent (Gang Beasts feel)
+  if (state.velocity.y < 0 && !grounded) {
+    state.velocity.y += GRAVITY * (EXTRA_GRAVITY_FALLING - 1.0) * dt;
+  }
   if (state.velocity.y < MAX_FALL_SPEED) {
     state.velocity.y = MAX_FALL_SPEED;
   }
@@ -125,7 +131,13 @@ export function integrateMotion(state: MotionState, input: InputFrame, dt: numbe
   }
 
   if (Math.abs(desired.x) > 0.2 || Math.abs(desired.z) > 0.2) {
-    state.facingYaw = Math.atan2(desired.x, desired.z);
+    const targetYaw = Math.atan2(desired.x, desired.z);
+    let diff = targetYaw - state.facingYaw;
+    // Wrap to [-PI, PI]
+    while (diff > Math.PI) diff -= 2 * Math.PI;
+    while (diff < -Math.PI) diff += 2 * Math.PI;
+    const maxTurn = TURN_SPEED_RAD * dt;
+    state.facingYaw += Math.max(-maxTurn, Math.min(maxTurn, diff));
   }
 
   return state;

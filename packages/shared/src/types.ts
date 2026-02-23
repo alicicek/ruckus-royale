@@ -3,7 +3,7 @@ import { ARENAS } from "./constants";
 export type ArenaId = (typeof ARENAS)[number];
 
 export type MatchMode = "online" | "solo" | "practice";
-export type BotDifficulty = "easy" | "normal" | "hard";
+export type BotDifficulty = "easy" | "normal" | "hard" | "dummy";
 
 export interface Vector3Net {
   x: number;
@@ -41,6 +41,7 @@ export interface PlayerStateNet {
   name: string;
   role: PlayerRole;
   alive: boolean;
+  knockedOut: boolean;
   position: Vector3Net;
   velocity: Vector3Net;
   facingYaw: number;

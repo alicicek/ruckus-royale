@@ -18,6 +18,12 @@ export interface InternalPlayerState extends PlayerStateNet {
   spawnDelay: number;
   botDifficulty?: BotDifficulty;
   botMind?: BotMind;
+  /** Track previous grab input for edge-triggering */
+  prevGrabInput: boolean;
+  /** Timer for dead-player gravity (seconds remaining to process physics after death) */
+  deathPhysicsTimer: number;
+  /** Countdown until auto-recovery from knocked-out state (seconds) */
+  knockoutTimer: number;
   /** Server-side ragdoll hint tracking */
   ragdollStiffness: number;
   ragdollState: "active" | "hit" | "knockout" | "recovering";

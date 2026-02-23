@@ -37,6 +37,15 @@ import {
   RAGDOLL_THROW_IMPULSE,
   RAGDOLL_THROW_UPWARD,
   RAGDOLL_GRAB_STIFFNESS_DROP,
+  RAGDOLL_MAX_STIFFNESS_ACTIVE,
+  RAGDOLL_LIMB_MAX_STIFFNESS,
+  LEAN_ACCELERATION_FACTOR,
+  LEAN_MAX_PITCH,
+  LEAN_MAX_ROLL,
+  LEAN_DECAY_RATE,
+  LEAN_LANDING_IMPULSE,
+  IDLE_SWAY_AMPLITUDE,
+  IDLE_SWAY_FREQUENCY,
 } from "@ruckus/shared";
 
 // ── Types ──
@@ -84,6 +93,19 @@ export interface RagdollInstance {
   attackTimer: number;
   attackPhase: AttackPhase;
   attackArm: "left" | "right";
+  leanPitchRad: number;
+  leanRollRad: number;
+  prevVelX: number;
+  prevVelZ: number;
+  idleSwayPhase: number;
+  wasAirborne: boolean;
+  landingStiffnessTimer: number;
+  /** Animation-derived target world positions for PD tracking */
+  animTargetPositions: Map<BoneName, { x: number; y: number; z: number }>;
+  /** Animation-derived target local quaternions for revolute joint motors */
+  animTargetQuaternions: Map<BoneName, { x: number; y: number; z: number; w: number }>;
+  /** Whether animation targets are available this frame */
+  hasAnimTargets: boolean;
 }
 
 /**
@@ -142,7 +164,7 @@ export class RagdollManager {
     // positioned by the game's capsule movement system, and limbs use
     // PD motors. Real gravity would fight the motors and cause drift.
     // Instead we apply a gentle downward pull per-limb for natural sag.
-    this.world = new RAPIER.World({ x: 0, y: -4.0, z: 0 });
+    this.world = new RAPIER.World({ x: 0, y: -15.0, z: 0 });
 
     // Create a static ground plane collider so ragdoll limbs rest on
     // the floor surface instead of clipping through it.
@@ -212,6 +234,7 @@ export class RagdollManager {
     isSprinting = false,
   ): void {
     const ragdoll = this.ensure(id);
+    ragdoll.hasAnimTargets = false;
 
     // Raise the torso so ragdoll legs can reach the floor naturally
     const raisedPos = { x: position.x, y: position.y + RAGDOLL_VISUAL_OFFSET_Y, z: position.z };
@@ -230,8 +253,68 @@ export class RagdollManager {
     } else {
       // Normal: only move torso kinematically, limbs follow via joints
       torso.setTranslation(raisedPos, true);
-      const quat = yawToQuat(facingYaw);
-      torso.setRotation(quat, true);
+
+      // ── Torso lean system (Gang Beasts "balancing on a ball") ──
+      // Compute acceleration from velocity delta
+      const accelX = (velocity.x - ragdoll.prevVelX) / Math.max(dt, 1/120);
+      const accelZ = (velocity.z - ragdoll.prevVelZ) / Math.max(dt, 1/120);
+      ragdoll.prevVelX = velocity.x;
+      ragdoll.prevVelZ = velocity.z;
+
+      // Convert acceleration to local-space lean (forward = pitch, lateral = roll)
+      const cosYaw = Math.cos(facingYaw);
+      const sinYaw = Math.sin(facingYaw);
+      const localAccelForward = accelX * sinYaw + accelZ * cosYaw;
+      const localAccelLateral = accelX * cosYaw - accelZ * sinYaw;
+
+      // Target lean from acceleration
+      const targetPitch = -localAccelForward * LEAN_ACCELERATION_FACTOR;
+      const targetRoll = localAccelLateral * LEAN_ACCELERATION_FACTOR;
+
+      // Smooth lean with exponential decay toward target
+      const decayFactor = 1 - Math.exp(-LEAN_DECAY_RATE * dt);
+      ragdoll.leanPitchRad += (targetPitch - ragdoll.leanPitchRad) * decayFactor;
+      ragdoll.leanRollRad += (targetRoll - ragdoll.leanRollRad) * decayFactor;
+
+      // Add idle sway when nearly stationary
+      const speed = Math.sqrt(velocity.x * velocity.x + velocity.z * velocity.z);
+      const idleBlend = Math.max(0, 1 - speed * 0.5);
+      ragdoll.idleSwayPhase += dt * IDLE_SWAY_FREQUENCY * Math.PI * 2;
+      ragdoll.leanRollRad += Math.sin(ragdoll.idleSwayPhase) * IDLE_SWAY_AMPLITUDE * idleBlend;
+      ragdoll.leanPitchRad += Math.sin(ragdoll.idleSwayPhase * 0.7 + 1.3) * IDLE_SWAY_AMPLITUDE * 0.5 * idleBlend;
+
+      // Clamp lean angles
+      ragdoll.leanPitchRad = Math.max(-LEAN_MAX_PITCH, Math.min(LEAN_MAX_PITCH, ragdoll.leanPitchRad));
+      ragdoll.leanRollRad = Math.max(-LEAN_MAX_ROLL, Math.min(LEAN_MAX_ROLL, ragdoll.leanRollRad));
+
+      // Landing detection
+      const airborne = position.y > 0.6;
+      if (ragdoll.wasAirborne && !airborne) {
+        // Just landed — apply landing effects
+        ragdoll.landingStiffnessTimer = 0.3;
+        ragdoll.leanPitchRad += LEAN_LANDING_IMPULSE;
+        // Apply downward impulse to all limbs for "squish" effect
+        for (const [name, body] of ragdoll.bodies) {
+          if (name === "torso") continue;
+          body.applyImpulse({ x: 0, y: -2.0, z: 0 }, true);
+        }
+      }
+      ragdoll.wasAirborne = airborne;
+
+      // Landing stiffness reduction
+      if (ragdoll.landingStiffnessTimer > 0) {
+        ragdoll.landingStiffnessTimer -= dt;
+        const landingFactor = 0.6;
+        ragdoll.stiffnessScale *= landingFactor;
+        for (const [limbName] of ragdoll.bodies) {
+          const current = ragdoll.limbStiffness.get(limbName) ?? 0.75;
+          ragdoll.limbStiffness.set(limbName, current * landingFactor);
+        }
+      }
+
+      // Compose lean rotation with facing yaw
+      const leanQuat = composeLeanQuat(facingYaw, ragdoll.leanPitchRad, ragdoll.leanRollRad);
+      torso.setRotation(leanQuat, true);
     }
 
     // Update state machine
@@ -446,6 +529,19 @@ export class RagdollManager {
     ragdoll.attackPhase = type === "heavy" ? "windup" : "strike";
   }
 
+  /** Set animation-derived target positions/quaternions for PD tracking. */
+  setAnimationTargets(
+    id: string,
+    positions: Map<BoneName, { x: number; y: number; z: number }>,
+    quaternions: Map<BoneName, { x: number; y: number; z: number; w: number }>,
+  ): void {
+    const ragdoll = this.ragdolls.get(id);
+    if (!ragdoll) return;
+    ragdoll.animTargetPositions = positions;
+    ragdoll.animTargetQuaternions = quaternions;
+    ragdoll.hasAnimTargets = true;
+  }
+
   /**
    * Create a physics spring joint between grabber's hand and target's torso.
    * This gives the grab a physical, wobbly feel instead of a hard position lock.
@@ -466,7 +562,7 @@ export class RagdollManager {
 
     // Create a spring joint between hand and target torso
     const jointData = RAPIER.JointData.spring(
-      0.3, // rest length (slightly apart)
+      0.5, // rest length (more visible spring wobble)
       RAGDOLL_GRAB_STIFFNESS,
       RAGDOLL_GRAB_DAMPING,
       { x: 0, y: -RAGDOLL_LOWER_ARM_HALF_LENGTH, z: 0 }, // anchor on hand (tip of forearm)
@@ -603,35 +699,40 @@ export class RagdollManager {
           // Limbs with lower order values recover faster (earlier in the ramp)
           const limbRate = RAGDOLL_HIT_RECOVERY_RATE * (1.0 - order * 0.6);
           const current = ragdoll.limbStiffness.get(limbName) ?? 0;
-          const next = Math.min(1, current + limbRate * dt);
+          const limbCap = RAGDOLL_LIMB_MAX_STIFFNESS[limbName] ?? RAGDOLL_MAX_STIFFNESS_ACTIVE;
+          const next = Math.min(limbCap, current + limbRate * dt);
           ragdoll.limbStiffness.set(limbName, next);
-          if (next < 0.99) allRecovered = false;
+          if (next < limbCap - 0.01) allRecovered = false;
         }
-        // Overall stiffness is the minimum limb stiffness (conservative)
-        let minStiffness = 1;
+        // Overall stiffness is the minimum limb stiffness (conservative), capped
+        let minStiffness = RAGDOLL_MAX_STIFFNESS_ACTIVE;
         for (const val of ragdoll.limbStiffness.values()) {
           if (val < minStiffness) minStiffness = val;
         }
         ragdoll.stiffnessScale = minStiffness;
 
         if (allRecovered) {
-          ragdoll.stiffnessScale = 1;
+          ragdoll.stiffnessScale = RAGDOLL_MAX_STIFFNESS_ACTIVE;
           ragdoll.state = "active";
           for (const [limbName] of ragdoll.bodies) {
-            ragdoll.limbStiffness.set(limbName, 1);
+            const limbCap2 = RAGDOLL_LIMB_MAX_STIFFNESS[limbName] ?? RAGDOLL_MAX_STIFFNESS_ACTIVE;
+            ragdoll.limbStiffness.set(limbName, limbCap2);
           }
         }
         break;
       }
 
-      case "active":
+      case "active": {
         // Stun reduces stiffness slightly for wobble effect
-        ragdoll.stiffnessScale = 1 - Math.min(0.5, stun * 0.005);
-        // Keep per-limb stiffness in sync
+        const baseStiffness = 1 - Math.min(0.5, stun * 0.005);
+        ragdoll.stiffnessScale = Math.min(baseStiffness, RAGDOLL_MAX_STIFFNESS_ACTIVE);
+        // Keep per-limb stiffness in sync, capped per limb
         for (const [limbName] of ragdoll.bodies) {
-          ragdoll.limbStiffness.set(limbName, ragdoll.stiffnessScale);
+          const limbCap = RAGDOLL_LIMB_MAX_STIFFNESS[limbName] ?? RAGDOLL_MAX_STIFFNESS_ACTIVE;
+          ragdoll.limbStiffness.set(limbName, Math.min(ragdoll.stiffnessScale, limbCap));
         }
         break;
+      }
     }
   }
 }
@@ -643,6 +744,27 @@ function createRagdoll(world: RAPIER.World, ragdollIndex: number): RagdollInstan
   const joints = new Map<string, RAPIER.ImpulseJoint>();
   const group = ragdollCollisionGroup(ragdollIndex);
 
+  // Per-limb damping: arms are floppier, legs stiffer, head in between
+  const limbDamping: Record<string, { linear: number; angular: number }> = {
+    l_upper_arm: { linear: 1.0, angular: 1.5 },
+    r_upper_arm: { linear: 1.0, angular: 1.5 },
+    l_lower_arm: { linear: 1.0, angular: 1.5 },
+    r_lower_arm: { linear: 1.0, angular: 1.5 },
+    l_thigh:     { linear: 2.5, angular: 3.5 },
+    r_thigh:     { linear: 2.5, angular: 3.5 },
+    l_shin:      { linear: 2.5, angular: 3.5 },
+    r_shin:      { linear: 2.5, angular: 3.5 },
+    head:        { linear: 2.0, angular: 3.0 },
+  };
+
+  // Per-limb friction: shins/thighs get low friction so legs slide on ground
+  const limbFriction: Record<string, number> = {
+    l_shin: 0.0,
+    r_shin: 0.0,
+    l_thigh: 0.05,
+    r_thigh: 0.05,
+  };
+
   // Helper to create a body part
   function makePart(
     name: BoneName,
@@ -651,12 +773,13 @@ function createRagdoll(world: RAPIER.World, ragdollIndex: number): RagdollInstan
     radius: number,
     isRoot: boolean,
   ): RAPIER.RigidBody {
+    const damp = limbDamping[name] ?? { linear: 3.0, angular: 4.0 };
     const desc = isRoot
       ? RAPIER.RigidBodyDesc.kinematicPositionBased().setTranslation(pos.x, pos.y, pos.z)
       : RAPIER.RigidBodyDesc.dynamic()
           .setTranslation(pos.x, pos.y, pos.z)
-          .setLinearDamping(3.0)
-          .setAngularDamping(4.0);
+          .setLinearDamping(damp.linear)
+          .setAngularDamping(damp.angular);
 
     const rb = world.createRigidBody(desc);
 
@@ -665,7 +788,7 @@ function createRagdoll(world: RAPIER.World, ragdollIndex: number): RagdollInstan
         RAPIER.ColliderDesc.capsule(halfHeight, radius)
           .setCollisionGroups(group)
           .setMass(isRoot ? 0 : 1.0)
-          .setFriction(0.3)
+          .setFriction(limbFriction[name] ?? 0.3)
           .setRestitution(0.05),
         rb,
       );
@@ -674,7 +797,7 @@ function createRagdoll(world: RAPIER.World, ragdollIndex: number): RagdollInstan
         RAPIER.ColliderDesc.ball(radius)
           .setCollisionGroups(group)
           .setMass(isRoot ? 0 : 0.5)
-          .setFriction(0.3)
+          .setFriction(limbFriction[name] ?? 0.3)
           .setRestitution(0.05),
         rb,
       );
@@ -888,6 +1011,16 @@ function createRagdoll(world: RAPIER.World, ragdollIndex: number): RagdollInstan
     attackTimer: 0,
     attackPhase: "idle",
     attackArm: "right",
+    leanPitchRad: 0,
+    leanRollRad: 0,
+    prevVelX: 0,
+    prevVelZ: 0,
+    idleSwayPhase: Math.random() * Math.PI * 2,
+    wasAirborne: false,
+    landingStiffnessTimer: 0,
+    animTargetPositions: new Map(),
+    animTargetQuaternions: new Map(),
+    hasAnimTargets: false,
   };
 }
 
@@ -933,11 +1066,24 @@ function applyMotorTargets(
         }
         rev.configureMotorPosition(elbowTarget, pd.kp * scale * 1.5, pd.kd * scale * 1.5);
       } else {
+        // Check for animation target
+        if (ragdoll.hasAnimTargets) {
+          const animBone = (name.includes("l_") ? "l_lower_arm" : "r_lower_arm") as BoneName;
+          const animQ = ragdoll.animTargetQuaternions.get(animBone);
+          if (animQ) {
+            // Extract rotation around X axis (the elbow hinge axis)
+            const sinHalfAngle = Math.sqrt(animQ.x * animQ.x);
+            const angle = 2 * Math.atan2(sinHalfAngle, animQ.w);
+            const clampedAngle = Math.max(RAGDOLL_LIMITS.elbow.min, Math.min(RAGDOLL_LIMITS.elbow.max, angle));
+            rev.configureMotorPosition(clampedAngle, pd.kp * scale, pd.kd * scale);
+            continue; // skip the procedural target
+          }
+        }
         // Normal arm swing — snappier with pow shaping, slight phase offset from legs
         const armPhaseOffset = 0.3; // arms lag behind legs slightly for natural counter-rotation
         const rawSwing = isMoving ? Math.sin(timeSec * walkFreq + (name.includes("l_") ? 0 : Math.PI) + armPhaseOffset) : 0;
         const shaped = Math.sign(rawSwing) * Math.pow(Math.abs(rawSwing), 0.7);
-        const swing = isMoving ? shaped * (isSprinting ? 0.8 : 0.6) : 0.15;
+        const swing = isMoving ? shaped * (isSprinting ? 0.8 : 0.6) : 0.05;
         rev.configureMotorPosition(swing, pd.kp * scale, pd.kd * scale);
       }
     }
@@ -947,6 +1093,20 @@ function applyMotorTargets(
       const pd = RAGDOLL_PD.knee;
       const boneName = (name.includes("l_") ? "l_shin" : "r_shin") as BoneName;
       const scale = limbScale(boneName);
+
+      // Check for animation target
+      if (ragdoll.hasAnimTargets) {
+        const animBone = (name.includes("l_") ? "l_shin" : "r_shin") as BoneName;
+        const animQ = ragdoll.animTargetQuaternions.get(animBone);
+        if (animQ) {
+          const sinHalfAngle = Math.sqrt(animQ.x * animQ.x);
+          const angle = 2 * Math.atan2(sinHalfAngle, animQ.w);
+          const clampedAngle = Math.max(RAGDOLL_LIMITS.knee.min, Math.min(RAGDOLL_LIMITS.knee.max, angle));
+          rev.configureMotorPosition(clampedAngle, pd.kp * scale, pd.kd * scale);
+          continue; // skip the procedural target
+        }
+      }
+
       if (isMoving) {
         // Asymmetric knee lift: only bend on "lift" half of cycle
         const raw = Math.sin(timeSec * walkFreq + (name.includes("l_") ? Math.PI : 0));
@@ -1023,20 +1183,33 @@ function applyMotorTargets(
     target.y += torsoPos.y;
     target.z += torsoPos.z;
 
+    // Override with animation target if available
+    if (ragdoll.hasAnimTargets) {
+      const animTarget = ragdoll.animTargetPositions.get(armBone);
+      if (animTarget) {
+        target.x = animTarget.x;
+        target.y = animTarget.y;
+        target.z = animTarget.z;
+      }
+    }
+
     // Spring force toward target
     const dx = target.x - armPos.x;
     const dy = target.y - armPos.y;
     const dz = target.z - armPos.z;
 
-    const forceMult = isSideAttacking ? 2.0 : 1.0;
+    // Reduce idle arm forces to let arms hang naturally under gravity (prevents vertical bobbing)
+    const forceMult = isSideAttacking ? 2.0 : (!isMoving && !isSideAttacking ? 0.5 : 1.0);
     const force = shoulderPD.kp * armScale * 0.01 * forceMult;
     const damp = shoulderPD.kd * armScale * 0.01 * forceMult;
     const vel = upperArm.linvel();
 
+    const armMass = 1.0; // arm collider mass
+    const gravCompArm = armMass * 12.0 * 0.016; // lighter compensation for arms (want some sag)
     upperArm.applyImpulse(
       {
         x: dx * force - vel.x * damp,
-        y: dy * force - vel.y * damp,
+        y: dy * force - vel.y * damp + gravCompArm,
         z: dz * force - vel.z * damp,
       },
       true,
@@ -1091,6 +1264,15 @@ function applyMotorTargets(
     hipTarget.y += torsoPos.y;
     hipTarget.z += torsoPos.z;
 
+    if (ragdoll.hasAnimTargets) {
+      const animTarget = ragdoll.animTargetPositions.get(thighBone);
+      if (animTarget) {
+        hipTarget.x = animTarget.x;
+        hipTarget.y = animTarget.y;
+        hipTarget.z = animTarget.z;
+      }
+    }
+
     const hdx = hipTarget.x - thighPos.x;
     const hdy = hipTarget.y - thighPos.y;
     const hdz = hipTarget.z - thighPos.z;
@@ -1099,10 +1281,12 @@ function applyMotorTargets(
     const hDamp = hipPD.kd * thighScale * 0.01;
     const hVel = thigh.linvel();
 
+    const thighMass = 1.0;
+    const gravCompThigh = thighMass * 13.0 * 0.016;
     thigh.applyImpulse(
       {
         x: hdx * hForce - hVel.x * hDamp,
-        y: hdy * hForce - hVel.y * hDamp,
+        y: hdy * hForce - hVel.y * hDamp + gravCompThigh,
         z: hdz * hForce - hVel.z * hDamp,
       },
       true,
@@ -1115,8 +1299,8 @@ function applyMotorTargets(
   const headPos = headBody.translation();
   const headPD = RAGDOLL_PD.head;
 
-  // Idle breathing: subtle head bob when stationary
-  const breathBob = !isMoving ? Math.sin(timeSec * 1.5) * 0.015 : 0;
+  // Idle breathing: very subtle head bob (reduced to prevent vertical oscillation with low PD gains)
+  const breathBob = !isMoving ? Math.sin(timeSec * 1.5) * 0.003 : 0;
   const headTargetLocal = {
     x: 0,
     y: RAGDOLL_TORSO_HALF_HEIGHT + RAGDOLL_HEAD_RADIUS + 0.08 + breathBob,
@@ -1127,6 +1311,15 @@ function applyMotorTargets(
   headTarget.y += torsoPos.y;
   headTarget.z += torsoPos.z;
 
+  if (ragdoll.hasAnimTargets) {
+    const animTarget = ragdoll.animTargetPositions.get("head");
+    if (animTarget) {
+      headTarget.x = animTarget.x;
+      headTarget.y = animTarget.y;
+      headTarget.z = animTarget.z;
+    }
+  }
+
   const hhdx = headTarget.x - headPos.x;
   const hhdy = headTarget.y - headPos.y;
   const hhdz = headTarget.z - headPos.z;
@@ -1135,10 +1328,15 @@ function applyMotorTargets(
   const headDamp = headPD.kd * headScale * 0.01;
   const headVel = headBody.linvel();
 
+  // Extra vertical damping on head to suppress bounce oscillation from torso lean
+  const headVerticalDamp = headDamp * 2.5;
+  // Gravity compensation: counteract most of gravity so PD only handles error correction
+  const headMass = 0.5; // head collider mass
+  const gravCompHead = headMass * 14.0 * 0.016; // ~93% gravity compensation
   headBody.applyImpulse(
     {
       x: hhdx * headForce - headVel.x * headDamp,
-      y: hhdy * headForce - headVel.y * headDamp,
+      y: hhdy * headForce - headVel.y * headVerticalDamp + gravCompHead,
       z: hhdz * headForce - headVel.z * headDamp,
     },
     true,
@@ -1150,6 +1348,19 @@ function applyMotorTargets(
 function yawToQuat(yaw: number): { x: number; y: number; z: number; w: number } {
   const halfYaw = yaw * 0.5;
   return { x: 0, y: Math.sin(halfYaw), z: 0, w: Math.cos(halfYaw) };
+}
+
+function composeLeanQuat(yaw: number, pitch: number, roll: number): { x: number; y: number; z: number; w: number } {
+  // Compose: Ry(yaw) * Rx(pitch) * Rz(roll)
+  const cy = Math.cos(yaw * 0.5), sy = Math.sin(yaw * 0.5);
+  const cp = Math.cos(pitch * 0.5), sp = Math.sin(pitch * 0.5);
+  const cr = Math.cos(roll * 0.5), sr = Math.sin(roll * 0.5);
+  return {
+    x: cy * sp * cr + sy * cp * sr,
+    y: sy * cp * cr - cy * sp * sr,
+    z: cy * cp * sr - sy * sp * cr,
+    w: cy * cp * cr + sy * sp * sr,
+  };
 }
 
 function rotateByQuat(
