@@ -29,6 +29,12 @@ const ARENA_LABELS: Record<ArenaId, string> = {
   factory_pit: "Factory Pit",
 };
 
+const MODE_LABELS: Record<MatchMode, string> = {
+  online: "Online",
+  solo: "Solo",
+  practice: "Practice",
+};
+
 interface RoomInfoMessage {
   roomCode: string;
   mode: MatchMode;
@@ -619,6 +625,13 @@ class SceneRenderer {
   }
 }
 
+function lerpAngle(a: number, b: number, t: number): number {
+  let diff = b - a;
+  while (diff > Math.PI) diff -= 2 * Math.PI;
+  while (diff < -Math.PI) diff += 2 * Math.PI;
+  return a + diff * t;
+}
+
 class RuckusGame {
   private readonly canvas = document.querySelector<HTMLCanvasElement>("#game-canvas")!;
   private readonly menuPanel = document.querySelector<HTMLElement>("#menu-panel")!;
@@ -630,6 +643,7 @@ class RuckusGame {
   private readonly createButton = document.querySelector<HTMLButtonElement>("#create-room-btn")!;
   private readonly joinButton = document.querySelector<HTMLButtonElement>("#join-room-btn")!;
   private readonly soloButton = document.querySelector<HTMLButtonElement>("#solo-btn")!;
+  private readonly practiceButton = document.querySelector<HTMLButtonElement>("#practice-btn")!;
   private readonly readyButton = document.querySelector<HTMLButtonElement>("#ready-btn")!;
   private readonly rematchButton = document.querySelector<HTMLButtonElement>("#rematch-btn")!;
   private readonly fullscreenButton = document.querySelector<HTMLButtonElement>("#fullscreen-btn")!;
@@ -679,6 +693,7 @@ class RuckusGame {
   };
 
   constructor() {
+    this.canvas.tabIndex = 0;
     this.input = new InputController(this.canvas);
     this.renderer = new SceneRenderer(this.canvas, this.wobble);
 
@@ -686,9 +701,72 @@ class RuckusGame {
     this.installDebugHooks();
   }
 
+  private setModeButtonsDisabled(disabled: boolean): void {
+    this.createButton.disabled = disabled;
+    this.joinButton.disabled = disabled;
+    this.soloButton.disabled = disabled;
+    this.practiceButton.disabled = disabled;
+  }
+
+  private focusGameplayCanvas(): void {
+    const active = document.activeElement;
+    if (active instanceof HTMLElement && active !== this.canvas) {
+      active.blur();
+    }
+    this.canvas.focus({ preventScroll: true });
+  }
+
+  private isGameplayKey(code: string): boolean {
+    switch (code) {
+      case "KeyW":
+      case "KeyA":
+      case "KeyS":
+      case "KeyD":
+      case "ArrowUp":
+      case "ArrowDown":
+      case "ArrowLeft":
+      case "ArrowRight":
+      case "Space":
+      case "KeyE":
+      case "KeyJ":
+      case "KeyK":
+      case "KeyC":
+      case "ShiftLeft":
+      case "ShiftRight":
+      case "KeyF":
+        return true;
+      default:
+        return false;
+    }
+  }
+
   async init(): Promise<void> {
     this.setStatus(`Status: Ready. Server ${SERVER_URL}`);
     requestAnimationFrame(this.loop);
+  }
+
+  private isRoomSendSafe(room: Room | null): room is Room {
+    if (!room) return false;
+    const connection = (room as Room & { connection?: unknown }).connection as
+      | {
+          isOpen?: boolean;
+        }
+      | undefined;
+
+    // Colyseus transport shape differs across runtimes; trust `send` try/catch for final safety.
+    return connection?.isOpen !== false;
+  }
+
+  private safeSend(type: string, payload: unknown): boolean {
+    const room = this.room;
+    if (!this.isRoomSendSafe(room)) return false;
+    try {
+      room.send(type as never, payload as never);
+      return true;
+    } catch {
+      // Ignore transient teardown races while sockets are closing.
+      return false;
+    }
   }
 
   private bindUI(): void {
@@ -707,14 +785,18 @@ class RuckusGame {
       this.connect({ mode: "solo", join: false }).catch((error) => this.handleError(error));
     });
 
+    this.practiceButton.addEventListener("click", () => {
+      this.connect({ mode: "practice", join: false }).catch((error) => this.handleError(error));
+    });
+
     this.readyButton.addEventListener("click", () => {
       this.localReady = !this.localReady;
-      this.room?.send("ready_state", { ready: this.localReady });
+      this.safeSend("ready_state", { ready: this.localReady });
       this.readyButton.textContent = this.localReady ? "Ready: ON" : "Ready: OFF";
     });
 
     this.rematchButton.addEventListener("click", () => {
-      this.room?.send("vote_rematch", { vote: true });
+      this.safeSend("vote_rematch", { vote: true });
       this.rematchButton.textContent = "Rematch Voted";
     });
 
@@ -727,6 +809,17 @@ class RuckusGame {
         this.toggleFullscreen().catch((error) => this.handleError(error));
       }
     });
+
+    const swallowGameplayKeys = (event: KeyboardEvent) => {
+      if (!this.room) return;
+      if (!this.isGameplayKey(event.code)) return;
+      event.preventDefault();
+      if (document.activeElement !== this.canvas) {
+        this.focusGameplayCanvas();
+      }
+    };
+    window.addEventListener("keydown", swallowGameplayKeys, { capture: true });
+    window.addEventListener("keyup", swallowGameplayKeys, { capture: true });
 
     document.addEventListener("fullscreenchange", () => {
       this.renderer.resize();
@@ -772,7 +865,7 @@ class RuckusGame {
 
     const room = this.room;
     this.localTick = 0;
-    this.localReady = params.mode === "solo";
+    this.localReady = params.mode !== "online";
     this.pendingInputs = [];
     this.predictedLocal = null;
     this.interpolation.clear();
@@ -782,7 +875,7 @@ class RuckusGame {
       this.latestRoundMode = msg.mode;
       this.localPlayerId = msg.playerId;
       this.hudRoom.textContent = `Room: ${msg.roomCode}`;
-      this.hudMode.textContent = `Mode: ${msg.mode === "solo" ? "Solo" : "Online"}`;
+      this.hudMode.textContent = `Mode: ${MODE_LABELS[msg.mode]}`;
       this.roomCodeInput.value = msg.roomCode;
       this.setStatus(`Status: Connected to ${msg.roomCode}`);
     });
@@ -795,42 +888,78 @@ class RuckusGame {
       this.onRoundEvent(event);
     });
 
+    room.onMessage("sync_tick", (data: { serverTick: number }) => {
+      this.localTick = data.serverTick;
+    });
+
     room.onLeave(() => {
       this.setStatus("Status: Disconnected from room");
       this.room = null;
+      this.setModeButtonsDisabled(false);
+      this.menuPanel.classList.add("visible");
     });
 
-    room.send("join_room", payload);
-    room.send("ready_state", { ready: this.localReady });
+    this.safeSend("join_room", payload);
+    this.safeSend("ready_state", { ready: this.localReady });
 
     this.readyButton.textContent = this.localReady ? "Ready: ON" : "Ready: OFF";
     this.rematchButton.textContent = "Vote Rematch";
 
+    this.setModeButtonsDisabled(true);
     this.menuPanel.classList.remove("visible");
+    this.focusGameplayCanvas();
   }
 
   private async disconnect(): Promise<void> {
-    if (!this.room) return;
-    await this.room.leave(true);
+    const room = this.room;
     this.room = null;
+    if (!room) return;
+    try {
+      if (this.isRoomSendSafe(room)) {
+        await room.leave(true);
+      }
+    } catch {
+      // Ignore disconnect races from closing browsers/test harnesses.
+    }
+    this.setModeButtonsDisabled(false);
+    this.menuPanel.classList.add("visible");
   }
 
   private onSnapshot(snapshot: SnapshotNet): void {
     this.latestSnapshot = snapshot;
     this.latestRoundMode = snapshot.roundState.mode;
+    this.localTick = Math.max(this.localTick, snapshot.serverTick);
 
     const now = performance.now();
     for (const player of snapshot.players) {
-      const list = this.interpolation.get(player.id) ?? [];
-      list.push({ atMs: now, state: structuredClone(player) });
-      const pruned = list.filter((entry) => now - entry.atMs <= 1800);
-      this.interpolation.set(player.id, pruned);
+      let list = this.interpolation.get(player.id);
+      if (!list) {
+        list = [];
+        this.interpolation.set(player.id, list);
+      }
+      list.push({
+        atMs: now,
+        state: {
+          ...player,
+          position: { ...player.position },
+          velocity: { ...player.velocity },
+        },
+      });
+      // Prune old entries in-place
+      const cutoff = now - 1800;
+      let pruneIdx = 0;
+      while (pruneIdx < list.length && list[pruneIdx].atMs < cutoff) pruneIdx++;
+      if (pruneIdx > 0) list.splice(0, pruneIdx);
     }
 
     if (this.localPlayerId) {
       const authoritative = snapshot.players.find((player) => player.id === this.localPlayerId);
       if (authoritative) {
-        this.predictedLocal = structuredClone(authoritative);
+        this.predictedLocal = {
+          ...authoritative,
+          position: { ...authoritative.position },
+          velocity: { ...authoritative.velocity },
+        };
         this.pendingInputs = this.pendingInputs.filter((input) => input.tick > authoritative.lastInputTick);
 
         for (const pending of this.pendingInputs) {
@@ -920,7 +1049,7 @@ class RuckusGame {
   private updateHud(snapshot: SnapshotNet): void {
     const round = snapshot.roundState;
     this.hudRoom.textContent = `Room: ${this.latestRoomCode}`;
-    this.hudMode.textContent = `Mode: ${round.mode === "solo" ? "Solo" : "Online"}`;
+    this.hudMode.textContent = `Mode: ${MODE_LABELS[round.mode]}`;
     this.hudRound.textContent = `Round: ${round.roundNumber}/${round.maxRounds} (${round.phase})`;
     this.hudTimer.textContent = `Time: ${round.roundTimeLeft.toFixed(1)}s${round.suddenDeath ? " - Sudden Death" : ""}`;
     this.hudArena.textContent = `Arena: ${ARENA_LABELS[round.arena]}`;
@@ -946,9 +1075,9 @@ class RuckusGame {
     if (!this.room || !this.latestSnapshot || !this.localPlayerId) return;
     if (this.latestSnapshot.roundState.phase !== "active") return;
 
-    this.localTick += 1;
+    this.localTick = Math.max(this.localTick, this.latestSnapshot.serverTick) + 1;
     const input = this.input.sample(this.localTick);
-    this.room.send("player_input", input);
+    if (!this.safeSend("player_input", input)) return;
     this.pendingInputs.push(input);
 
     if (this.pendingInputs.length > SERVER_TICK_RATE * 3) {
@@ -973,7 +1102,7 @@ class RuckusGame {
 
   private resolveInterpolatedState(player: PlayerStateNet, renderTimeMs: number): PlayerStateNet {
     if (player.id === this.localPlayerId && this.predictedLocal && this.latestSnapshot?.roundState.phase === "active") {
-      return structuredClone(this.predictedLocal);
+      return this.predictedLocal;
     }
 
     const history = this.interpolation.get(player.id);
@@ -1009,7 +1138,7 @@ class RuckusGame {
         y: lerp(older.state.velocity.y, newer.state.velocity.y),
         z: lerp(older.state.velocity.z, newer.state.velocity.z),
       },
-      facingYaw: lerp(older.state.facingYaw, newer.state.facingYaw),
+      facingYaw: lerpAngle(older.state.facingYaw, newer.state.facingYaw, t),
     };
   }
 
@@ -1071,16 +1200,20 @@ class RuckusGame {
       };
     }
 
-    const players = this.latestSnapshot.players.map((player) => ({
-      id: player.id,
-      name: player.name,
-      alive: player.alive,
-      role: player.role,
-      position: { ...player.position },
-      velocity: { ...player.velocity },
-      stun: player.stun,
-      wins: player.wins,
-    }));
+    const renderTimeMs = this.simulationNowMs - INTERPOLATION_DELAY_MS;
+    const players = this.latestSnapshot.players.map((player) => {
+      const resolved = this.resolveInterpolatedState(player, renderTimeMs);
+      return {
+        id: resolved.id,
+        name: resolved.name,
+        alive: resolved.alive,
+        role: resolved.role,
+        position: { ...resolved.position },
+        velocity: { ...resolved.velocity },
+        stun: resolved.stun,
+        wins: resolved.wins,
+      };
+    });
 
     return {
       coordinateSystem: {

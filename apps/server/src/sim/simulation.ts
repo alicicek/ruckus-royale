@@ -8,12 +8,16 @@ import {
   HEAVY_ATTACK_COOLDOWN,
   HEAVY_ATTACK_RANGE,
   HEAVY_STUN_DAMAGE,
+  ATTACK_IMPULSE_HEAVY,
+  ATTACK_IMPULSE_LIGHT,
+  LATE_INPUT_WINDOW_MS,
   LIGHT_ATTACK_COOLDOWN,
   LIGHT_ATTACK_RANGE,
   LIGHT_STUN_DAMAGE,
   MAX_PLAYERS,
   PLAYER_RADIUS,
   ROUND_DURATION_SECONDS,
+  SERVER_TICK_RATE,
   STUN_KNOCKOUT_THRESHOLD,
   SUDDEN_DEATH_SECONDS,
   WINS_TO_WIN_MATCH,
@@ -33,6 +37,7 @@ import {
   type PlayerStateNet,
   type RoundStateNet,
   type SnapshotNet,
+  type Vector3Net,
 } from "@ruckus/shared";
 import { buildBotInput } from "../bots/botController";
 import type { InternalHazard, InternalPlayerState, SimulationConfig } from "./types";
@@ -49,6 +54,15 @@ const EMPTY_INPUT: InputFrame = {
   emote: false,
 };
 
+const SOLO_INITIAL_ACTIVE_BOTS = 2;
+const SOLO_MAX_ACTIVE_BOTS = 2;
+const SOLO_BOT_CAP_RAMP_SECONDS = 18;
+const SOLO_BOT_SPAWN_INTERVAL_SECONDS = 10;
+const SOLO_GRACE_SECONDS = 8;
+const SOLO_BOT_SPEED_RAMP_SECONDS = 40;
+const SOLO_EDGE_PROTECTION_SECONDS = 32;
+const SOLO_MIN_ROUND_SECONDS = 30;
+
 function randomCode(): string {
   const chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
   let out = "";
@@ -58,7 +72,7 @@ function randomCode(): string {
   return out;
 }
 
-function randomName(prefix: string, index: number): string {
+function fallbackName(prefix: string, index: number): string {
   return `${prefix}-${index}`;
 }
 
@@ -85,6 +99,8 @@ function createPlayer(id: string, name: string, role: "human" | "bot"): Internal
     rematchVote: false,
     connected: role === "bot",
     latestInput: { ...EMPTY_INPUT },
+    queuedSpawn: false,
+    spawnDelay: 0,
   };
 }
 
@@ -105,7 +121,8 @@ export class BrawlSimulation {
   private roundTimer = 0;
   private betweenRoundTimer = 0;
   private countdownTimer = 0;
-  private roundWinners: string[] = [];
+  private spawnPositions: Vector3Net[] = [];
+  private spawnCursor = 0;
 
   constructor(config: SimulationConfig) {
     this.mode = config.mode;
@@ -137,7 +154,25 @@ export class BrawlSimulation {
         scoreboard: { ...this.roundState.scoreboard },
         survivors: [...this.roundState.survivors],
       },
-      players: [...this.players.values()].map((player) => ({ ...player, position: { ...player.position }, velocity: { ...player.velocity } })),
+      players: [...this.players.values()].map((p): PlayerStateNet => ({
+        id: p.id,
+        name: p.name,
+        role: p.role,
+        alive: p.alive,
+        position: { ...p.position },
+        velocity: { ...p.velocity },
+        facingYaw: p.facingYaw,
+        stun: p.stun,
+        grabbedTargetId: p.grabbedTargetId,
+        grabbedById: p.grabbedById,
+        lastInputTick: p.lastInputTick,
+        attackCooldownLight: p.attackCooldownLight,
+        attackCooldownHeavy: p.attackCooldownHeavy,
+        grabCooldown: p.grabCooldown,
+        emoteTimer: p.emoteTimer,
+        knockouts: p.knockouts,
+        wins: p.wins,
+      })),
       hazards: this.hazards.map((hazard) => ({
         id: hazard.id,
         kind: hazard.kind,
@@ -163,12 +198,13 @@ export class BrawlSimulation {
     if (existing) {
       existing.connected = true;
       existing.name = displayName;
+      existing.lastInputTick = this.serverTick;
       return;
     }
 
     const player = createPlayer(playerId, displayName, "human");
     player.connected = true;
-    player.isReady = this.mode === "solo";
+    player.isReady = this.mode === "solo" || this.mode === "practice";
     this.players.set(playerId, player);
     this.humanIds.add(playerId);
 
@@ -228,7 +264,7 @@ export class BrawlSimulation {
     if (this.roundState.phase !== "active") return;
     if (input.tick <= player.lastInputTick) return;
 
-    const lateWindowTicks = Math.floor((250 / 1000) * 60);
+    const lateWindowTicks = Math.floor((LATE_INPUT_WINDOW_MS / 1000) * SERVER_TICK_RATE);
     if (input.tick < this.serverTick - lateWindowTicks) return;
 
     player.latestInput = {
@@ -319,9 +355,15 @@ export class BrawlSimulation {
 
   private handleActiveRound(dt: number): void {
     this.roundTimer += dt;
-    this.roundState.roundTimeLeft = Math.max(0, ROUND_DURATION_SECONDS - this.roundTimer);
-    this.roundState.suddenDeath = this.roundTimer >= SUDDEN_DEATH_SECONDS;
+    if (this.mode === "practice") {
+      this.roundState.roundTimeLeft = ROUND_DURATION_SECONDS;
+      this.roundState.suddenDeath = false;
+    } else {
+      this.roundState.roundTimeLeft = Math.max(0, ROUND_DURATION_SECONDS - this.roundTimer);
+      this.roundState.suddenDeath = this.roundTimer >= SUDDEN_DEATH_SECONDS;
+    }
 
+    this.updateSoloBotSpawns(dt);
     this.updateBotInputs(dt);
 
     for (const player of this.players.values()) {
@@ -340,16 +382,19 @@ export class BrawlSimulation {
 
       const input = player.latestInput;
 
-      integrateMotion(
-        {
-          position: player.position,
-          velocity: player.velocity,
-          facingYaw: player.facingYaw,
-        },
-        input,
-        dt,
-        this.arena,
-      );
+      const motionState = {
+        position: player.position,
+        velocity: player.velocity,
+        facingYaw: player.facingYaw,
+      };
+      integrateMotion(motionState, input, dt, this.arena);
+      player.facingYaw = motionState.facingYaw;
+
+      if (this.isGraceProtectedHuman(player)) {
+        const bounds = arenaBounds(this.arena);
+        player.position.x = clamp(player.position.x, bounds.minX + 2.2, bounds.maxX - 2.2);
+        player.position.z = clamp(player.position.z, bounds.minZ + 2.2, bounds.maxZ - 2.2);
+      }
 
       if (input.emote) {
         player.emoteTimer = 0.8;
@@ -372,9 +417,22 @@ export class BrawlSimulation {
       }
 
       if (input.jump && edgeDistance(this.arena, player.position) < 1) {
-        const inward = normalize2(-player.position.x, -player.position.z);
-        player.velocity.x += inward.x * EDGE_RECOVERY_BOOST * dt;
-        player.velocity.z += inward.z * EDGE_RECOVERY_BOOST * dt;
+        const bounds = arenaBounds(this.arena);
+        const distLeft = player.position.x - bounds.minX;
+        const distRight = bounds.maxX - player.position.x;
+        const distBottom = player.position.z - bounds.minZ;
+        const distTop = bounds.maxZ - player.position.z;
+        const minDist = Math.min(distLeft, distRight, distBottom, distTop);
+
+        let pushX = 0;
+        let pushZ = 0;
+        if (minDist === distLeft) pushX = 1;
+        else if (minDist === distRight) pushX = -1;
+        else if (minDist === distBottom) pushZ = 1;
+        else pushZ = -1;
+
+        player.velocity.x += pushX * EDGE_RECOVERY_BOOST * dt;
+        player.velocity.z += pushZ * EDGE_RECOVERY_BOOST * dt;
       }
 
       if (player.stun >= STUN_KNOCKOUT_THRESHOLD) {
@@ -389,6 +447,14 @@ export class BrawlSimulation {
 
     for (const player of this.players.values()) {
       if (!player.alive) continue;
+      if (this.isEdgeProtectedHuman(player)) {
+        const bounds = arenaBounds(this.arena);
+        player.position.x = clamp(player.position.x, bounds.minX + 0.9, bounds.maxX - 0.9);
+        player.position.z = clamp(player.position.z, bounds.minZ + 0.9, bounds.maxZ - 0.9);
+        player.position.y = Math.max(player.position.y, bounds.floorY + PLAYER_RADIUS);
+        if (player.velocity.y < 0) player.velocity.y = 0;
+        continue;
+      }
       if (inRingOutZone(this.arena, player.position)) {
         this.knockout(player.id, "ring-out");
       }
@@ -396,15 +462,23 @@ export class BrawlSimulation {
 
     this.roundState.survivors = [...this.players.values()].filter((player) => player.alive).map((player) => player.id);
 
-    if (this.roundState.survivors.length <= 1 || this.roundState.roundTimeLeft <= 0) {
+    if (this.shouldFinishRound()) {
       this.finishRound();
     }
   }
 
   private updateBotInputs(dt: number): void {
     const players = [...this.players.values()];
+    const soloAggression = this.soloBotAggressionScale();
+
     for (const player of players) {
       if (player.role !== "bot") continue;
+      if (!player.alive) {
+        player.latestInput = { ...EMPTY_INPUT, tick: this.serverTick };
+        player.lastInputTick = this.serverTick;
+        continue;
+      }
+
       const input = buildBotInput({
         tick: this.serverTick,
         dt,
@@ -413,6 +487,16 @@ export class BrawlSimulation {
         players,
         hazards: this.hazards,
       });
+
+      if (this.mode === "solo") {
+        input.moveX *= soloAggression;
+        input.moveZ *= soloAggression;
+        input.sprint = input.sprint && soloAggression > 0.72;
+        input.lightAttack = input.lightAttack && Math.random() < soloAggression;
+        input.heavyAttack = input.heavyAttack && Math.random() < soloAggression * 0.6;
+        input.grab = input.grab && Math.random() < soloAggression * 0.8;
+      }
+
       player.latestInput = input;
       player.lastInputTick = input.tick;
     }
@@ -426,6 +510,7 @@ export class BrawlSimulation {
 
     for (const candidate of this.players.values()) {
       if (!candidate.alive || candidate.id === player.id || candidate.grabbedById) continue;
+      if (this.mode === "solo" && player.role === "bot" && candidate.role === "human" && this.roundTimer < 20) continue;
       const dx = candidate.position.x - player.position.x;
       const dz = candidate.position.z - player.position.z;
       const dist = Math.hypot(dx, dz);
@@ -507,13 +592,14 @@ export class BrawlSimulation {
     const isHeavy = kind === "heavy";
     const range = isHeavy ? HEAVY_ATTACK_RANGE : LIGHT_ATTACK_RANGE;
     const damage = isHeavy ? HEAVY_STUN_DAMAGE : LIGHT_STUN_DAMAGE;
-    const impulse = isHeavy ? 9.3 : 6.2;
+    const impulse = isHeavy ? ATTACK_IMPULSE_HEAVY : ATTACK_IMPULSE_LIGHT;
 
     const fx = Math.sin(attacker.facingYaw);
     const fz = Math.cos(attacker.facingYaw);
 
     for (const target of this.players.values()) {
       if (!target.alive || target.id === attacker.id) continue;
+      if (this.mode === "solo" && attacker.role === "bot" && this.isGraceProtectedHuman(target)) continue;
 
       const dx = target.position.x - attacker.position.x;
       const dz = target.position.z - attacker.position.z;
@@ -524,10 +610,12 @@ export class BrawlSimulation {
       if (align < -0.35) continue;
 
       const dir = normalize2(dx, dz);
-      target.velocity.x += dir.x * impulse;
-      target.velocity.y += isHeavy ? 4.6 : 2.8;
-      target.velocity.z += dir.z * impulse;
-      target.stun += damage;
+      const versusHuman = this.mode === "solo" && attacker.role === "bot" && target.role === "human";
+      const pressure = versusHuman ? this.soloBotPlayerPressureScale() : 1;
+      target.velocity.x += dir.x * impulse * pressure;
+      target.velocity.y += (isHeavy ? 4.6 : 2.8) * pressure;
+      target.velocity.z += dir.z * impulse * pressure;
+      target.stun += damage * pressure;
 
       if (target.grabbedById) {
         this.releaseGrab(target.grabbedById);
@@ -642,6 +730,8 @@ export class BrawlSimulation {
 
     for (const player of this.players.values()) {
       if (!player.alive) continue;
+      const graceProtected = this.isGraceProtectedHuman(player);
+      const graceScale = graceProtected ? 0.28 : 1;
 
       for (const hazard of this.hazards) {
         if (!hazard.active) continue;
@@ -650,8 +740,8 @@ export class BrawlSimulation {
           const nearZ = Math.abs(player.position.z - hazard.position.z) <= hazard.radius * 0.65;
           const nearX = Math.abs(player.position.x - hazard.position.x) <= hazard.radius + 4;
           if (nearZ && nearX) {
-            player.velocity.x += hazard.velocity.x * dt * 0.9;
-            player.stun += dt * 4 * intensity;
+            player.velocity.x += hazard.velocity.x * dt * 0.9 * graceScale;
+            player.stun += dt * 4 * intensity * graceScale;
           }
           continue;
         }
@@ -671,10 +761,10 @@ export class BrawlSimulation {
         const hazardSpeed = Math.hypot(hazard.velocity.x, hazard.velocity.y, hazard.velocity.z);
         const push = 3.2 + hazardSpeed * 0.45;
 
-        player.velocity.x += nx * push;
-        player.velocity.y += ny * push * 0.8 + 1.1;
-        player.velocity.z += nz * push;
-        player.stun += HAZARD_STUN_DAMAGE * 0.02 * intensity + hazardSpeed * 0.09;
+        player.velocity.x += nx * push * graceScale;
+        player.velocity.y += (ny * push * 0.8 + 1.1) * graceScale;
+        player.velocity.z += nz * push * graceScale;
+        player.stun += (HAZARD_STUN_DAMAGE * 0.02 * intensity + hazardSpeed * 0.09) * graceScale;
 
         this.onRoundEvent({
           type: "hazard_hit",
@@ -682,6 +772,9 @@ export class BrawlSimulation {
           atTick: this.serverTick,
         });
 
+        if (graceProtected) {
+          continue;
+        }
         if (hazard.kind === "press") {
           this.knockout(player.id, "hazard-impact");
         } else if (hazardSpeed > 7.2 && player.stun > STUN_KNOCKOUT_THRESHOLD * 0.85) {
@@ -698,6 +791,28 @@ export class BrawlSimulation {
   private knockout(targetId: string, reason: string, actorId?: string): void {
     const player = this.players.get(targetId);
     if (!player || !player.alive) return;
+    if (this.mode === "practice" && player.role === "human") {
+      const bounds = arenaBounds(this.arena);
+      player.position.x = clamp(player.position.x, bounds.minX + 2.5, bounds.maxX - 2.5);
+      player.position.y = bounds.floorY + PLAYER_RADIUS;
+      player.position.z = clamp(player.position.z, bounds.minZ + 2.5, bounds.maxZ - 2.5);
+      player.velocity.x = 0;
+      player.velocity.y = 0;
+      player.velocity.z = 0;
+      player.stun = Math.min(player.stun, STUN_KNOCKOUT_THRESHOLD * 0.25);
+      return;
+    }
+    if (this.mode === "solo" && player.role === "human" && this.roundTimer < SOLO_EDGE_PROTECTION_SECONDS) {
+      const bounds = arenaBounds(this.arena);
+      player.position.x = clamp(player.position.x, bounds.minX + 1.8, bounds.maxX - 1.8);
+      player.position.y = bounds.floorY + PLAYER_RADIUS;
+      player.position.z = clamp(player.position.z, bounds.minZ + 1.8, bounds.maxZ - 1.8);
+      player.velocity.x = 0;
+      player.velocity.y = 0;
+      player.velocity.z = 0;
+      player.stun = Math.min(player.stun, STUN_KNOCKOUT_THRESHOLD * 0.35);
+      return;
+    }
 
     if (player.grabbedById) {
       this.releaseGrab(player.grabbedById);
@@ -728,7 +843,6 @@ export class BrawlSimulation {
     if (winner) {
       this.roundState.scoreboard[winner.id] = (this.roundState.scoreboard[winner.id] ?? 0) + 1;
       winner.wins = this.roundState.scoreboard[winner.id];
-      this.roundWinners.push(winner.id);
     }
 
     for (const player of this.players.values()) {
@@ -765,15 +879,9 @@ export class BrawlSimulation {
   }
 
   private resolveMatchWinner(): string | null {
-    let bestId: string | null = null;
-    let bestScore = -1;
-    for (const [playerId, score] of Object.entries(this.roundState.scoreboard)) {
-      if (score > bestScore) {
-        bestId = playerId;
-        bestScore = score;
-      }
-    }
-    return bestId;
+    const entries = Object.entries(this.roundState.scoreboard);
+    entries.sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]));
+    return entries.length > 0 ? entries[0][0] : null;
   }
 
   private startRound(): void {
@@ -786,28 +894,36 @@ export class BrawlSimulation {
     this.arena = ARENAS[(this.roundState.roundNumber - 1) % ARENAS.length];
     this.roundState.arena = this.arena;
 
-    const spawn = createSpawnPositions(this.arena, Math.max(MAX_PLAYERS, this.players.size));
-    let idx = 0;
-    for (const player of this.players.values()) {
-      const pos = spawn[idx % spawn.length];
-      idx += 1;
+    this.spawnPositions = createSpawnPositions(this.arena, Math.max(MAX_PLAYERS, this.players.size));
+    this.spawnCursor = 0;
 
-      player.alive = true;
-      player.position.x = pos.x;
-      player.position.y = pos.y;
-      player.position.z = pos.z;
-      player.velocity.x = 0;
-      player.velocity.y = 0;
-      player.velocity.z = 0;
-      player.stun = 0;
-      player.grabbedById = null;
-      player.grabbedTargetId = null;
-      player.attackCooldownLight = 0;
-      player.attackCooldownHeavy = 0;
-      player.grabCooldown = 0;
-      player.latestInput = { ...EMPTY_INPUT, tick: this.serverTick };
-      player.rematchVote = false;
-      player.emoteTimer = 0;
+    const bots = [...this.players.values()].filter((player) => player.role === "bot").sort((a, b) => a.id.localeCompare(b.id));
+    const humans = [...this.players.values()].filter((player) => player.role === "human");
+    let queuedIndex = 0;
+
+    for (const player of [...humans, ...bots]) {
+      this.resetPlayerForRound(player);
+
+      if (this.mode === "solo" && player.role === "human") {
+        this.spawnSoloHumanSafely(player);
+        continue;
+      }
+
+      if (this.mode === "solo" && player.role === "bot") {
+        if (queuedIndex < SOLO_INITIAL_ACTIVE_BOTS) {
+          this.spawnPlayer(player);
+          queuedIndex += 1;
+        } else {
+          player.queuedSpawn = true;
+          player.spawnDelay = 2 + (queuedIndex - SOLO_INITIAL_ACTIVE_BOTS) * SOLO_BOT_SPAWN_INTERVAL_SECONDS;
+          player.alive = false;
+          player.position.y = -30;
+          queuedIndex += 1;
+        }
+        continue;
+      }
+
+      this.spawnPlayer(player);
     }
 
     this.createHazardsForArena(this.arena);
@@ -821,6 +937,11 @@ export class BrawlSimulation {
   }
 
   private createHazardsForArena(arena: ArenaId): void {
+    if (this.mode === "practice") {
+      this.hazards = [];
+      return;
+    }
+
     if (arena === "cargo_rooftop") {
       this.hazards = [
         {
@@ -974,7 +1095,7 @@ export class BrawlSimulation {
       idx += 1;
       if (this.players.has(id)) continue;
 
-      const bot = createPlayer(id, randomName("Bot", idx), "bot");
+      const bot = createPlayer(id, fallbackName("Bot", idx), "bot");
       bot.connected = true;
       bot.isReady = true;
       bot.botDifficulty = "normal";
@@ -987,6 +1108,105 @@ export class BrawlSimulation {
       this.players.set(id, bot);
       this.roundState.scoreboard[id] = this.roundState.scoreboard[id] ?? 0;
     }
+  }
+
+  private resetPlayerForRound(player: InternalPlayerState): void {
+    player.alive = true;
+    player.velocity.x = 0;
+    player.velocity.y = 0;
+    player.velocity.z = 0;
+    player.stun = 0;
+    player.grabbedById = null;
+    player.grabbedTargetId = null;
+    player.attackCooldownLight = 0;
+    player.attackCooldownHeavy = 0;
+    player.grabCooldown = 0;
+    player.latestInput = { ...EMPTY_INPUT, tick: this.serverTick };
+    player.rematchVote = false;
+    player.emoteTimer = 0;
+    player.queuedSpawn = false;
+    player.spawnDelay = 0;
+  }
+
+  private spawnPlayer(player: InternalPlayerState): void {
+    const pos = this.spawnPositions[this.spawnCursor % this.spawnPositions.length];
+    this.spawnCursor += 1;
+    player.alive = true;
+    player.position.x = pos.x;
+    player.position.y = pos.y;
+    player.position.z = pos.z;
+    player.queuedSpawn = false;
+    player.spawnDelay = 0;
+  }
+
+  private spawnSoloHumanSafely(player: InternalPlayerState): void {
+    const bounds = arenaBounds(this.arena);
+    player.alive = true;
+    player.position.x = 0;
+    player.position.y = bounds.floorY + PLAYER_RADIUS;
+    player.position.z = 0;
+    player.queuedSpawn = false;
+    player.spawnDelay = 0;
+  }
+
+  private updateSoloBotSpawns(dt: number): void {
+    if (this.mode !== "solo" || this.roundState.phase !== "active") return;
+
+    const bots = [...this.players.values()].filter((player) => player.role === "bot");
+    const activeBots = bots.filter((player) => player.alive).length;
+    const dynamicCap = Math.min(
+      SOLO_MAX_ACTIVE_BOTS,
+      SOLO_INITIAL_ACTIVE_BOTS + Math.floor(this.roundTimer / SOLO_BOT_CAP_RAMP_SECONDS),
+    );
+
+    let slots = Math.max(0, dynamicCap - activeBots);
+    if (slots === 0) return;
+
+    for (const bot of bots) {
+      if (!bot.queuedSpawn) continue;
+      bot.spawnDelay = Math.max(0, bot.spawnDelay - dt);
+      if (bot.spawnDelay > 0 || slots <= 0) continue;
+      this.spawnPlayer(bot);
+      slots -= 1;
+    }
+  }
+
+  private isGraceProtectedHuman(player: InternalPlayerState): boolean {
+    return this.mode === "solo" && player.role === "human" && this.roundTimer < SOLO_GRACE_SECONDS;
+  }
+
+  private isEdgeProtectedHuman(player: InternalPlayerState): boolean {
+    return this.mode === "solo" && player.role === "human" && this.roundTimer < SOLO_EDGE_PROTECTION_SECONDS;
+  }
+
+  private soloBotAggressionScale(): number {
+    if (this.mode !== "solo" || this.roundState.phase !== "active") return 1;
+    if (this.roundTimer < SOLO_GRACE_SECONDS) return 0.18;
+    const rampT = clamp((this.roundTimer - SOLO_GRACE_SECONDS) / SOLO_BOT_SPEED_RAMP_SECONDS, 0, 1);
+    return 0.3 + rampT * 0.45;
+  }
+
+  private soloBotPlayerPressureScale(): number {
+    if (this.mode !== "solo") return 1;
+    const rampT = clamp((this.roundTimer - SOLO_GRACE_SECONDS) / 40, 0, 1);
+    return 0.3 + rampT * 0.6;
+  }
+
+  private hasQueuedSoloBots(): boolean {
+    if (this.mode !== "solo") return false;
+    for (const player of this.players.values()) {
+      if (player.role === "bot" && player.queuedSpawn) return true;
+    }
+    return false;
+  }
+
+  private shouldFinishRound(): boolean {
+    if (this.mode === "practice") return false;
+    if (this.roundState.roundTimeLeft <= 0) return true;
+    if (this.roundState.survivors.length > 1) return false;
+    if (this.mode !== "solo") return true;
+    if (this.roundTimer < SOLO_MIN_ROUND_SECONDS) return false;
+    return !this.hasQueuedSoloBots();
   }
 
   private resetForRematch(): void {
@@ -1008,7 +1228,7 @@ export class BrawlSimulation {
       player.wins = 0;
       player.knockouts = 0;
       player.rematchVote = false;
-      player.isReady = this.mode === "solo" || player.role === "bot";
+      player.isReady = this.mode === "solo" || this.mode === "practice" || player.role === "bot";
       player.latestInput = { ...EMPTY_INPUT, tick: this.serverTick };
       player.stun = 0;
       player.alive = true;
@@ -1017,7 +1237,6 @@ export class BrawlSimulation {
     }
 
     this.hazards = [];
-    this.roundWinners = [];
     this.roundTimer = 0;
     this.betweenRoundTimer = 0;
     this.countdownTimer = 0;

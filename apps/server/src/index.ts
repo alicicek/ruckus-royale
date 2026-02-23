@@ -16,6 +16,7 @@ const httpServer = http.createServer(app);
 const gameServer = new Server({
   transport: new WebSocketTransport({
     server: httpServer,
+    maxPayload: 4096,
   }),
 });
 
@@ -35,12 +36,15 @@ app.get("/rooms", async (_req, res) => {
   });
 
   res.json({
-    rooms: rooms.map((room) => ({
-      roomId: room.roomId,
-      clients: room.clients,
-      maxClients: room.maxClients,
-      metadata: room.metadata,
-    })),
+    rooms: rooms.map((room) => {
+      const { roomCode: _, ...safeMetadata } = (room.metadata ?? {}) as Record<string, unknown>;
+      return {
+        roomId: room.roomId,
+        clients: room.clients,
+        maxClients: room.maxClients,
+        metadata: safeMetadata,
+      };
+    }),
   });
 });
 

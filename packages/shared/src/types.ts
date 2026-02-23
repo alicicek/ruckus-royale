@@ -2,7 +2,7 @@ import { ARENAS } from "./constants";
 
 export type ArenaId = (typeof ARENAS)[number];
 
-export type MatchMode = "online" | "solo";
+export type MatchMode = "online" | "solo" | "practice";
 export type BotDifficulty = "easy" | "normal" | "hard";
 
 export interface Vector3Net {
@@ -120,6 +120,7 @@ export interface RoundEvent {
   message?: string;
 }
 
+/** Debug / text-mode render payload used by the client for terminal rendering. */
 export interface RenderTextPayload {
   coordinateSystem: {
     origin: string;

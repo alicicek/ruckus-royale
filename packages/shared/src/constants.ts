@@ -28,10 +28,16 @@ export const LIGHT_ATTACK_COOLDOWN = 0.45;
 export const HEAVY_ATTACK_COOLDOWN = 0.95;
 export const GRAB_COOLDOWN = 0.35;
 
+export const ATTACK_IMPULSE_LIGHT = 6.2;
+export const ATTACK_IMPULSE_HEAVY = 9.3;
+
 export const LIGHT_STUN_DAMAGE = 14;
 export const HEAVY_STUN_DAMAGE = 32;
 export const HAZARD_STUN_DAMAGE = 45;
 export const STUN_KNOCKOUT_THRESHOLD = 100;
+export const STUN_DECAY_RATE = 4;
+
+export const COLLISION_BOUNCE = 3.5;
 
 export const EDGE_RECOVERY_BOOST = 9;
 

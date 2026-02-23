@@ -55,6 +55,7 @@ const ARENA_BOUNDS: Record<ArenaId, ArenaBounds> = {
 export const clamp = (value: number, min: number, max: number) =>
   Math.max(min, Math.min(max, value));
 
+/** Squared length in the XZ plane. Available for consumers (not used internally). */
 export const lengthSq2 = (x: number, z: number) => x * x + z * z;
 
 export const normalize2 = (x: number, z: number) => {
@@ -84,6 +85,14 @@ export function createSpawnPositions(arena: ArenaId, maxPlayers: number): Vector
   return out;
 }
 
+/**
+ * Integrates physics + facing for one tick. Mutates `state` in place AND returns it.
+ *
+ * IMPORTANT: `facingYaw` is a primitive — if you wrap a player object in a
+ * temporary `{ position, velocity, facingYaw }` literal, the updated yaw will
+ * NOT propagate back to the original object. Either pass the player object
+ * directly (it satisfies `MotionState`) or read `facingYaw` from the return value.
+ */
 export function integrateMotion(state: MotionState, input: InputFrame, dt: number, arena: ArenaId): MotionState {
   const bounds = arenaBounds(arena);
   const speedMult = input.sprint ? SPRINT_MULTIPLIER : 1;

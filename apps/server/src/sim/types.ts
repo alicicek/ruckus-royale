@@ -1,4 +1,4 @@
-import type { BotDifficulty, HazardStateNet, InputFrame, MatchMode, PlayerStateNet, RoundStateNet } from "@ruckus/shared";
+import type { BotDifficulty, HazardStateNet, InputFrame, MatchMode, PlayerStateNet } from "@ruckus/shared";
 
 export type BotMindState = "roam" | "chase" | "recover_edge" | "disengage_hazard" | "opportunistic_grab";
 
@@ -14,6 +14,8 @@ export interface InternalPlayerState extends PlayerStateNet {
   rematchVote: boolean;
   connected: boolean;
   latestInput: InputFrame;
+  queuedSpawn: boolean;
+  spawnDelay: number;
   botDifficulty?: BotDifficulty;
   botMind?: BotMind;
 }
@@ -39,10 +41,4 @@ export interface SimulationConfig {
     atTick: number;
     message?: string;
   }) => void;
-}
-
-export interface SimulationSnapshot {
-  roundState: RoundStateNet;
-  players: InternalPlayerState[];
-  hazards: InternalHazard[];
 }
