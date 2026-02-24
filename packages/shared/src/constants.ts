@@ -143,3 +143,44 @@ export const LEAN_DECAY_RATE = 4.0;
 export const LEAN_LANDING_IMPULSE = 0.25;
 export const IDLE_SWAY_AMPLITUDE = 0.04;
 export const IDLE_SWAY_FREQUENCY = 0.8;
+
+// ── Ragdoll contact skin (improves physics stability by keeping colliders slightly apart) ──
+export const RAGDOLL_CONTACT_SKIN = 0.02;
+
+// ── Quaternion PD torque tuning (for spherical joints: neck, shoulder, hip) ──
+export const QUAT_PD = {
+  neck:     { kp: 0.8, kd: 0.15, maxTorque: 2.0 },   // low kp, high kd, tight limits
+  shoulder: { kp: 0.3, kd: 0.06, maxTorque: 1.5 },   // medium kp, medium kd
+  hip:      { kp: 1.2, kd: 0.2,  maxTorque: 3.0 },   // stronger for stability
+};
+
+// ── Network correction smoothing ──
+export const RAGDOLL_CORRECTION_SMOOTH_RATE = 10.0; // exponential smoothing rate for medium corrections
+
+// ── Blob puppet proportions (physics-first, Gang Beasts style) ──
+export const BLOB_TORSO_HALF_HEIGHT = 0.30;
+export const BLOB_TORSO_RADIUS = 0.38;
+export const BLOB_HEAD_RADIUS = 0.22;
+export const BLOB_UPPER_ARM_HALF_LENGTH = 0.16;
+export const BLOB_LOWER_ARM_HALF_LENGTH = 0.14;
+export const BLOB_THIGH_HALF_LENGTH = 0.18;
+export const BLOB_SHIN_HALF_LENGTH = 0.18;
+export const BLOB_LIMB_RADIUS = 0.12;
+
+// ── Visual mode toggle ──
+export const USE_BLOB_VISUALS = true; // toggle between blob primitives and GLTF characters
+export const USE_BEAN_MESH = false;   // when true AND bean GLB exists, use it instead of blob primitives
+
+// ── Upright controller (scales lean limits by stiffness for drunk-but-controllable feel) ──
+export const UPRIGHT_KP = 5.0;
+export const UPRIGHT_KD = 1.5;
+export const UPRIGHT_MAX_LEAN = 0.35;    // max lean angle (radians) when at full stiffness
+export const UPRIGHT_FLOPPY_LEAN = 1.2;  // max lean angle (radians) when knocked out (stiffness=0)
+
+// ── Distance-based walk phase ──
+export const WALK_PHASE_RATE = 4.5;            // radians of phase per unit distance traveled
+export const STUMBLE_PHASE_AMPLITUDE = 0.6;    // max random phase perturbation when stiffness is low
+export const STUMBLE_PHASE_FREQUENCY = 2.5;    // how fast stumble noise oscillates (Hz)
+export const SPRINT_SWING_MULTIPLIER = 1.5;    // exaggeration factor for arm/leg swing during sprint
+export const SPRINT_KNEE_LIFT = 0.7;           // knee lift amount during sprint
+export const WALK_KNEE_LIFT = 0.4;             // knee lift amount during walk

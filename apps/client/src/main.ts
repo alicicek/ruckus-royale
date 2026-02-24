@@ -20,6 +20,16 @@ import {
   RAGDOLL_THIGH_HALF_LENGTH,
   RAGDOLL_SHIN_HALF_LENGTH,
   RAGDOLL_LIMB_RADIUS,
+  USE_BLOB_VISUALS,
+  USE_BEAN_MESH,
+  BLOB_TORSO_HALF_HEIGHT,
+  BLOB_TORSO_RADIUS,
+  BLOB_HEAD_RADIUS,
+  BLOB_UPPER_ARM_HALF_LENGTH,
+  BLOB_LOWER_ARM_HALF_LENGTH,
+  BLOB_THIGH_HALF_LENGTH,
+  BLOB_SHIN_HALF_LENGTH,
+  BLOB_LIMB_RADIUS,
   clamp,
   integrateMotion,
   type ArenaId,
@@ -33,7 +43,7 @@ import {
 } from "@ruckus/shared";
 import { RagdollManager, type BoneName, type RagdollBoneTransform } from "./ragdoll";
 import { ParticleManager } from "./particles";
-import { CharacterLoader, REVERSE_BONE_MAP, ANIM_MAP, type GameAnimState } from "./character-loader";
+import { CharacterLoader, REVERSE_BONE_MAP, REVERSE_BEAN_BONE_MAP, ANIM_MAP, BeanMeshLoader, type GameAnimState } from "./character-loader";
 
 const SERVER_URL = import.meta.env.VITE_SERVER_URL ?? "http://localhost:2567";
 const SERVER_HTTP_URL = SERVER_URL.replace(/^ws/i, "http");
@@ -96,6 +106,10 @@ interface PlayerVisual {
   animActions: Map<string, THREE.AnimationAction>;
   oneShotTimer: number;
   displayYaw: number;
+  /** Bean mesh state (null = not using bean mesh) */
+  beanGroup: THREE.Group | null;
+  beanBones: Map<BoneName, THREE.Bone> | null;
+  beanMeshes: THREE.SkinnedMesh[];
 }
 
 const hashToHue = (value: string) => {
@@ -344,6 +358,7 @@ class SceneRenderer {
 
   private readonly particles: ParticleManager;
   private readonly characterLoader: CharacterLoader;
+  private readonly beanMeshLoader: BeanMeshLoader;
   private readonly airborneState = new Map<string, boolean>();
 
   private activeArena: ArenaId | null = null;
@@ -405,6 +420,12 @@ class SceneRenderer {
     // Character loader (starts loading GLTF assets in background)
     this.characterLoader = new CharacterLoader();
     this.characterLoader.loadAll().catch((e) => console.warn("Character load failed, using fallback:", e));
+
+    // Bean mesh loader (loads procedural bean character GLB if USE_BEAN_MESH is enabled)
+    this.beanMeshLoader = new BeanMeshLoader();
+    if (USE_BEAN_MESH) {
+      this.beanMeshLoader.load().catch((e) => console.info("Bean mesh not available, using blob primitives:", e));
+    }
 
     // Post-processing: bloom for glow effects
     this.composer = new EffectComposer(this.renderer);
@@ -602,27 +623,58 @@ class SceneRenderer {
 
     const hue = hashToHue(id);
     const color = new THREE.Color(`hsl(${hue}deg 82% 62%)`);
-    const limbColor = color.clone().offsetHSL(0.02, 0, -0.07);
     const gm = this.toonGradientMap;
 
-    // Visual scale multiplier — meshes are fatter than physics colliders for chunky look
-    const VS = 1.4;
+    // Resolve dimensions and visual style based on blob vs GLTF mode
+    const isBlob = USE_BLOB_VISUALS;
+    const TORSO_HALF_H = isBlob ? BLOB_TORSO_HALF_HEIGHT : RAGDOLL_TORSO_HALF_HEIGHT;
+    const TORSO_R = isBlob ? BLOB_TORSO_RADIUS : RAGDOLL_TORSO_RADIUS;
+    const HEAD_R = isBlob ? BLOB_HEAD_RADIUS : RAGDOLL_HEAD_RADIUS;
+    const UPPER_ARM_HL = isBlob ? BLOB_UPPER_ARM_HALF_LENGTH : RAGDOLL_UPPER_ARM_HALF_LENGTH;
+    const LOWER_ARM_HL = isBlob ? BLOB_LOWER_ARM_HALF_LENGTH : RAGDOLL_LOWER_ARM_HALF_LENGTH;
+    const THIGH_HL = isBlob ? BLOB_THIGH_HALF_LENGTH : RAGDOLL_THIGH_HALF_LENGTH;
+    const SHIN_HL = isBlob ? BLOB_SHIN_HALF_LENGTH : RAGDOLL_SHIN_HALF_LENGTH;
+    const LIMB_R = isBlob ? BLOB_LIMB_RADIUS : RAGDOLL_LIMB_RADIUS;
+
+    // Blob mode: chunkier scale, cartoony colors with emissive glow
+    const VS = isBlob ? 1.6 : 1.4;
+    const limbColor = isBlob
+      ? color.clone().offsetHSL(0.02, 0, -0.10)
+      : color.clone().offsetHSL(0.02, 0, -0.07);
+    const headColor = isBlob
+      ? color.clone().offsetHSL(0, 0, 0.22)
+      : color.clone().offsetHSL(0, 0, 0.16);
+    const legColor = isBlob
+      ? limbColor.clone().offsetHSL(0, 0, -0.08)
+      : limbColor.clone().offsetHSL(0, 0, -0.05);
+
+    // Blob emissive glow for cartoony feel
+    const blobEmissive = isBlob ? color.clone().multiplyScalar(0.15) : undefined;
+    const blobEmissiveIntensity = isBlob ? 0.4 : 0;
 
     // Torso
-    const torsoMat = new THREE.MeshToonMaterial({ color, gradientMap: gm });
+    const torsoMat = new THREE.MeshToonMaterial({
+      color,
+      gradientMap: gm,
+      ...(isBlob ? { emissive: blobEmissive, emissiveIntensity: blobEmissiveIntensity } : {}),
+    });
     addFresnelRim(torsoMat);
     const torso = new THREE.Mesh(
-      new THREE.CapsuleGeometry(RAGDOLL_TORSO_RADIUS * VS, RAGDOLL_TORSO_HALF_HEIGHT * 2 * VS, 7, 14),
+      new THREE.CapsuleGeometry(TORSO_R * VS, TORSO_HALF_H * 2 * VS, 7, 14),
       torsoMat,
     );
     torso.castShadow = true;
     torso.receiveShadow = true;
 
     // Head
-    const headMat = new THREE.MeshToonMaterial({ color: color.clone().offsetHSL(0, 0, 0.16), gradientMap: gm });
+    const headMat = new THREE.MeshToonMaterial({
+      color: headColor,
+      gradientMap: gm,
+      ...(isBlob ? { emissive: headColor.clone().multiplyScalar(0.12), emissiveIntensity: 0.35 } : {}),
+    });
     addFresnelRim(headMat);
     const head = new THREE.Mesh(
-      new THREE.SphereGeometry(RAGDOLL_HEAD_RADIUS * VS, 16, 14),
+      new THREE.SphereGeometry(HEAD_R * VS, 16, 14),
       headMat,
     );
     head.castShadow = true;
@@ -630,7 +682,11 @@ class SceneRenderer {
 
     // Arms (upper + lower)
     const makeArm = (halfLen: number, radius: number) => {
-      const mat = new THREE.MeshToonMaterial({ color: limbColor, gradientMap: gm });
+      const mat = new THREE.MeshToonMaterial({
+        color: limbColor,
+        gradientMap: gm,
+        ...(isBlob ? { emissive: limbColor.clone().multiplyScalar(0.12), emissiveIntensity: 0.3 } : {}),
+      });
       addFresnelRim(mat);
       const mesh = new THREE.Mesh(
         new THREE.CapsuleGeometry(radius * VS, halfLen * 2 * VS, 4, 8),
@@ -641,14 +697,18 @@ class SceneRenderer {
       return mesh;
     };
 
-    const leftArm = makeArm(RAGDOLL_UPPER_ARM_HALF_LENGTH, RAGDOLL_LIMB_RADIUS);
-    const rightArm = makeArm(RAGDOLL_UPPER_ARM_HALF_LENGTH, RAGDOLL_LIMB_RADIUS);
-    const leftForearm = makeArm(RAGDOLL_LOWER_ARM_HALF_LENGTH, RAGDOLL_LIMB_RADIUS * 0.9);
-    const rightForearm = makeArm(RAGDOLL_LOWER_ARM_HALF_LENGTH, RAGDOLL_LIMB_RADIUS * 0.9);
+    const leftArm = makeArm(UPPER_ARM_HL, LIMB_R);
+    const rightArm = makeArm(UPPER_ARM_HL, LIMB_R);
+    const leftForearm = makeArm(LOWER_ARM_HL, LIMB_R * 0.9);
+    const rightForearm = makeArm(LOWER_ARM_HL, LIMB_R * 0.9);
 
     // Legs (thigh + shin)
     const makeLeg = (halfLen: number, radius: number) => {
-      const mat = new THREE.MeshToonMaterial({ color: limbColor.clone().offsetHSL(0, 0, -0.05), gradientMap: gm });
+      const mat = new THREE.MeshToonMaterial({
+        color: legColor,
+        gradientMap: gm,
+        ...(isBlob ? { emissive: legColor.clone().multiplyScalar(0.10), emissiveIntensity: 0.25 } : {}),
+      });
       addFresnelRim(mat);
       const mesh = new THREE.Mesh(
         new THREE.CapsuleGeometry(radius * VS, halfLen * 2 * VS, 4, 8),
@@ -659,10 +719,10 @@ class SceneRenderer {
       return mesh;
     };
 
-    const leftThigh = makeLeg(RAGDOLL_THIGH_HALF_LENGTH, RAGDOLL_LIMB_RADIUS * 1.1);
-    const rightThigh = makeLeg(RAGDOLL_THIGH_HALF_LENGTH, RAGDOLL_LIMB_RADIUS * 1.1);
-    const leftShin = makeLeg(RAGDOLL_SHIN_HALF_LENGTH, RAGDOLL_LIMB_RADIUS * 0.85);
-    const rightShin = makeLeg(RAGDOLL_SHIN_HALF_LENGTH, RAGDOLL_LIMB_RADIUS * 0.85);
+    const leftThigh = makeLeg(THIGH_HL, LIMB_R * 1.1);
+    const rightThigh = makeLeg(THIGH_HL, LIMB_R * 1.1);
+    const leftShin = makeLeg(SHIN_HL, LIMB_R * 0.85);
+    const rightShin = makeLeg(SHIN_HL, LIMB_R * 0.85);
 
     // Emote indicator
     const emote = new THREE.Mesh(
@@ -682,7 +742,7 @@ class SceneRenderer {
     group.add(emote, shadow);
     this.playerGroup.add(group);
 
-    // Map bone names → meshes for ragdoll-driven positioning
+    // Map bone names -> meshes for ragdoll-driven positioning
     const boneMeshes = new Map<BoneName, THREE.Mesh>();
     boneMeshes.set("torso", torso);
     boneMeshes.set("head", head);
@@ -701,14 +761,14 @@ class SceneRenderer {
       originalEmissives.set(mesh, mat.emissive.clone());
     }
 
-    // Try to set up GLTF character model
+    // Try to set up GLTF character model (skip when blob visuals are active)
     let gltfGroup: THREE.Group | null = null;
     let gltfBones: Map<BoneName, THREE.Bone> | null = null;
     let gltfMeshes: THREE.SkinnedMesh[] = [];
     let mixer: THREE.AnimationMixer | null = null;
     const animActions = new Map<string, THREE.AnimationAction>();
 
-    if (this.characterLoader.isLoaded()) {
+    if (!isBlob && this.characterLoader.isLoaded()) {
       const charName = this.characterLoader.pickCharacter(id);
       const charData = this.characterLoader.cloneCharacter(charName);
 
@@ -717,7 +777,7 @@ class SceneRenderer {
         gltfBones = new Map<BoneName, THREE.Bone>();
         gltfMeshes = charData.skinnedMeshes;
 
-        // Build bone mapping: our BoneName → GLTF Bone
+        // Build bone mapping: our BoneName -> GLTF Bone
         for (const [gameBone, kaykitName] of Object.entries(REVERSE_BONE_MAP)) {
           const bone = charData.bonesByName.get(kaykitName);
           if (bone) {
@@ -726,12 +786,12 @@ class SceneRenderer {
         }
 
         // Apply toon materials to GLTF meshes with player color tint
-        const gm = this.toonGradientMap;
+        const gm2 = this.toonGradientMap;
         for (const sm of gltfMeshes) {
           const oldMat = sm.material as THREE.MeshStandardMaterial;
           const toonMat = new THREE.MeshToonMaterial({
             map: oldMat.map,
-            gradientMap: gm,
+            gradientMap: gm2,
             color: color.clone().lerp(new THREE.Color(0xffffff), 0.5),
           });
           addFresnelRim(toonMat);
@@ -767,12 +827,63 @@ class SceneRenderer {
       }
     }
 
+    // Try to set up bean mesh (when USE_BEAN_MESH is enabled and GLB exists)
+    let beanGroup: THREE.Group | null = null;
+    let beanBones: Map<BoneName, THREE.Bone> | null = null;
+    let beanMeshes: THREE.SkinnedMesh[] = [];
+
+    if (USE_BEAN_MESH && !gltfGroup && this.beanMeshLoader.isLoaded()) {
+      const beanData = this.beanMeshLoader.cloneBean();
+
+      if (beanData) {
+        beanGroup = beanData.group;
+        beanBones = new Map<BoneName, THREE.Bone>();
+        beanMeshes = beanData.skinnedMeshes;
+
+        // Build bone mapping: our BoneName -> bean armature Bone
+        for (const [gameBone, beanBoneName] of Object.entries(REVERSE_BEAN_BONE_MAP)) {
+          const bone = beanData.bonesByName.get(beanBoneName);
+          if (bone) {
+            beanBones.set(gameBone as BoneName, bone);
+          }
+        }
+
+        // Apply toon materials with player color tint
+        const gm2 = this.toonGradientMap;
+        for (const sm of beanMeshes) {
+          const oldMat = sm.material as THREE.MeshStandardMaterial;
+          const toonMat = new THREE.MeshToonMaterial({
+            map: oldMat.map,
+            gradientMap: gm2,
+            color: color.clone(),
+            emissive: color.clone().multiplyScalar(0.12),
+            emissiveIntensity: 0.35,
+          });
+          addFresnelRim(toonMat);
+          sm.material = toonMat;
+          sm.castShadow = true;
+          sm.receiveShadow = true;
+          originalEmissives.set(sm as unknown as THREE.Mesh, toonMat.emissive.clone());
+        }
+
+        // Scale to match ragdoll proportions
+        beanGroup.scale.setScalar(1.0);
+
+        // Add bean group to player group, hide fallback blob meshes
+        group.add(beanGroup);
+        for (const mesh of boneMeshes.values()) {
+          mesh.visible = false;
+        }
+      }
+    }
+
     const visual: PlayerVisual = {
       group, torso, head, leftArm, rightArm, leftForearm, rightForearm,
       leftThigh, rightThigh, leftShin, rightShin, emote, color, boneMeshes,
       flashTimer: 0, originalEmissives,
       gltfGroup, gltfBones, gltfMeshes, mixer, currentAnim: gltfGroup ? "idle" : null, animActions,
       oneShotTimer: 0, displayYaw: NaN,
+      beanGroup, beanBones, beanMeshes,
     };
     this.playerVisuals.set(id, visual);
     return visual;
@@ -999,6 +1110,61 @@ class SceneRenderer {
             shadowChild.position.set(torsoT.x, 0.02, torsoT.z);
           }
         }
+      } else if (visual.beanGroup && visual.beanBones && bones) {
+        // ── Bean mesh mode: drive bean armature bones directly from ragdoll transforms ──
+        // No animations — the ragdoll physics IS the animation.
+        // Each ragdoll bone position/rotation drives the corresponding armature bone.
+
+        const torsoT = bones.get("torso");
+        if (torsoT) {
+          visual.group.position.set(0, 0, 0);
+          visual.group.rotation.set(0, 0, 0);
+
+          // Position bean group at ragdoll torso position
+          visual.beanGroup.position.set(torsoT.x, torsoT.y, torsoT.z);
+          if (isNaN(visual.displayYaw)) {
+            visual.displayYaw = player.facingYaw;
+          } else {
+            visual.displayYaw = lerpAngle(visual.displayYaw, player.facingYaw, 0.15);
+          }
+          visual.beanGroup.rotation.set(0, visual.displayYaw, 0);
+        }
+
+        // Drive bean armature bones from ragdoll physics
+        for (const [boneName, transform] of bones) {
+          const beanBone = visual.beanBones.get(boneName);
+          if (!beanBone || !beanBone.parent) continue;
+
+          // Convert ragdoll world transform to bone-local space
+          beanBone.parent.updateWorldMatrix(true, false);
+          _tmpMat4.copy(beanBone.parent.matrixWorld).invert();
+
+          _tmpVec3A.set(transform.x, transform.y, transform.z);
+          const localPos = _tmpVec3A.applyMatrix4(_tmpMat4);
+          beanBone.position.copy(localPos);
+
+          // Apply ragdoll rotation to bone
+          _tmpQuatA.set(transform.qx, transform.qy, transform.qz, transform.qw);
+          beanBone.parent.getWorldQuaternion(_tmpQuatB);
+          _tmpQuatB.invert().multiply(_tmpQuatA);
+          beanBone.quaternion.copy(_tmpQuatB);
+        }
+
+        // Position emote above head
+        const headT = bones.get("head");
+        if (headT) {
+          visual.emote.position.set(headT.x, headT.y + 0.35, headT.z);
+        }
+
+        // Position shadow below torso
+        if (torsoT) {
+          const shadowChild = visual.group.children.find(
+            (c) => c instanceof THREE.Mesh && c.geometry instanceof THREE.CircleGeometry,
+          );
+          if (shadowChild) {
+            shadowChild.position.set(torsoT.x, 0.02, torsoT.z);
+          }
+        }
       } else if (bones) {
         // ── Fallback capsule mode ──
         visual.group.position.set(0, 0, 0);
@@ -1043,8 +1209,9 @@ class SceneRenderer {
       }
 
       // Local player highlight
-      if (visual.gltfMeshes.length > 0) {
-        for (const sm of visual.gltfMeshes) {
+      const skinnedMeshList = visual.gltfMeshes.length > 0 ? visual.gltfMeshes : visual.beanMeshes;
+      if (skinnedMeshList.length > 0) {
+        for (const sm of skinnedMeshList) {
           const mat = sm.material as THREE.MeshToonMaterial;
           if (player.id === params.localPlayerId) {
             mat.emissive.setHex(0x183f53);
@@ -2017,6 +2184,18 @@ class RuckusGame {
 
 async function bootstrap(): Promise<void> {
   await RAPIER.init();
+
+  // Physics Lab mode: ?lab=1 in DEV builds only
+  if (import.meta.env.DEV) {
+    const params = new URLSearchParams(window.location.search);
+    if (params.get("lab") === "1") {
+      const { PhysicsLab } = await import("./physics-lab");
+      const lab = new PhysicsLab();
+      await lab.init();
+      return;
+    }
+  }
+
   const game = new RuckusGame();
   await game.init();
 }

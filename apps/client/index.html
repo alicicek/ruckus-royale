@@ -74,6 +74,101 @@
       </section>
 
       <section id="event-feed" class="events"></section>
+
+      <!-- Physics Lab overlay (hidden by default, shown when ?lab=1 in DEV mode) -->
+      <section id="lab-panel" class="lab-panel" style="display:none;">
+        <h2>Physics Lab</h2>
+        <div class="lab-row">
+          <label class="lab-toggle">
+            <input type="checkbox" id="lab-slow-motion" />
+            Slow Motion (0.25x)
+          </label>
+        </div>
+        <div class="lab-row">
+          <label class="lab-toggle">
+            <input type="checkbox" id="lab-pause" />
+            Pause Physics
+          </label>
+          <button id="lab-step-btn" class="lab-btn" disabled>Step</button>
+        </div>
+        <div class="lab-row">
+          <label class="lab-toggle">
+            <input type="checkbox" id="lab-debug-render" />
+            Debug Render
+          </label>
+        </div>
+        <div class="lab-row">
+          <label class="lab-label">Contact Skin: <span id="lab-contact-skin-val">0.02</span></label>
+          <input type="range" id="lab-contact-skin" min="0" max="0.05" step="0.005" value="0.02" />
+        </div>
+        <div class="lab-row">
+          <label class="lab-label">Physics Quality:</label>
+          <select id="lab-physics-quality">
+            <option value="4">Low (4 iters)</option>
+            <option value="8" selected>Medium (8 iters)</option>
+            <option value="12">High (12 iters)</option>
+          </select>
+        </div>
+        <!-- PD Tuning (collapsible) -->
+        <details class="lab-details">
+          <summary class="lab-summary">PD Tuning (Quaternion)</summary>
+          <div class="lab-pd-group">
+            <strong>Neck</strong>
+            <div class="lab-row">
+              <label class="lab-label">kp: <span id="lab-pd-neck-kp-val">0.80</span></label>
+              <input type="range" id="lab-pd-neck-kp" min="0" max="5" step="0.05" value="0.8" />
+            </div>
+            <div class="lab-row">
+              <label class="lab-label">kd: <span id="lab-pd-neck-kd-val">0.15</span></label>
+              <input type="range" id="lab-pd-neck-kd" min="0" max="2" step="0.01" value="0.15" />
+            </div>
+            <div class="lab-row">
+              <label class="lab-label">maxT: <span id="lab-pd-neck-max-val">2.00</span></label>
+              <input type="range" id="lab-pd-neck-max" min="0" max="10" step="0.1" value="2.0" />
+            </div>
+          </div>
+          <div class="lab-pd-group">
+            <strong>Shoulder</strong>
+            <div class="lab-row">
+              <label class="lab-label">kp: <span id="lab-pd-shoulder-kp-val">0.30</span></label>
+              <input type="range" id="lab-pd-shoulder-kp" min="0" max="5" step="0.05" value="0.3" />
+            </div>
+            <div class="lab-row">
+              <label class="lab-label">kd: <span id="lab-pd-shoulder-kd-val">0.06</span></label>
+              <input type="range" id="lab-pd-shoulder-kd" min="0" max="2" step="0.01" value="0.06" />
+            </div>
+            <div class="lab-row">
+              <label class="lab-label">maxT: <span id="lab-pd-shoulder-max-val">1.50</span></label>
+              <input type="range" id="lab-pd-shoulder-max" min="0" max="10" step="0.1" value="1.5" />
+            </div>
+          </div>
+          <div class="lab-pd-group">
+            <strong>Hip</strong>
+            <div class="lab-row">
+              <label class="lab-label">kp: <span id="lab-pd-hip-kp-val">1.20</span></label>
+              <input type="range" id="lab-pd-hip-kp" min="0" max="5" step="0.05" value="1.2" />
+            </div>
+            <div class="lab-row">
+              <label class="lab-label">kd: <span id="lab-pd-hip-kd-val">0.20</span></label>
+              <input type="range" id="lab-pd-hip-kd" min="0" max="2" step="0.01" value="0.2" />
+            </div>
+            <div class="lab-row">
+              <label class="lab-label">maxT: <span id="lab-pd-hip-max-val">3.00</span></label>
+              <input type="range" id="lab-pd-hip-max" min="0" max="10" step="0.1" value="3.0" />
+            </div>
+          </div>
+        </details>
+        <div class="lab-row">
+          <button id="lab-reset-btn" class="lab-btn">Reset Puppet</button>
+        </div>
+        <div class="lab-stats">
+          <div>FPS: <span id="lab-fps">0</span></div>
+          <div>Physics dt: <span id="lab-dt">0</span> ms</div>
+        </div>
+        <div class="lab-help">
+          <p>WASD: Move | Space: Jump | Shift: Sprint</p>
+        </div>
+      </section>
     </div>
 
     <script type="module" src="/src/main.ts"></script>

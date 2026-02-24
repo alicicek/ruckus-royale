@@ -46,6 +46,26 @@ import {
   LEAN_LANDING_IMPULSE,
   IDLE_SWAY_AMPLITUDE,
   IDLE_SWAY_FREQUENCY,
+  RAGDOLL_CORRECTION_SMOOTH_RATE,
+  RAGDOLL_CONTACT_SKIN,
+  QUAT_PD,
+  USE_BLOB_VISUALS,
+  BLOB_TORSO_HALF_HEIGHT,
+  BLOB_TORSO_RADIUS,
+  BLOB_HEAD_RADIUS,
+  BLOB_UPPER_ARM_HALF_LENGTH,
+  BLOB_LOWER_ARM_HALF_LENGTH,
+  BLOB_THIGH_HALF_LENGTH,
+  BLOB_SHIN_HALF_LENGTH,
+  BLOB_LIMB_RADIUS,
+  UPRIGHT_MAX_LEAN,
+  UPRIGHT_FLOPPY_LEAN,
+  WALK_PHASE_RATE,
+  STUMBLE_PHASE_AMPLITUDE,
+  STUMBLE_PHASE_FREQUENCY,
+  SPRINT_SWING_MULTIPLIER,
+  SPRINT_KNEE_LIFT,
+  WALK_KNEE_LIFT,
 } from "@ruckus/shared";
 
 // ── Types ──
@@ -106,6 +126,17 @@ export interface RagdollInstance {
   animTargetQuaternions: Map<BoneName, { x: number; y: number; z: number; w: number }>;
   /** Whether animation targets are available this frame */
   hasAnimTargets: boolean;
+  /** Smoothed correction target for medium network corrections */
+  smoothTargetX: number;
+  smoothTargetY: number;
+  smoothTargetZ: number;
+  smoothing: boolean;
+  /** Distance-based walk phase: 0 to 2*PI, advances based on distance traveled */
+  walkPhase: number;
+  /** Accumulated distance traveled for walk phase calculation */
+  walkDistance: number;
+  /** Stumble noise seed (unique per ragdoll for varied stumble patterns) */
+  stumbleNoiseSeed: number;
 }
 
 /**
@@ -134,6 +165,12 @@ function collisionGroup(membershipBit: number, filterMask: number): number {
 /**
  * Each ragdoll gets its own group bit (1-15). Limbs collide with environment
  * and OTHER ragdolls, but NOT with their own ragdoll's limbs.
+ *
+ * Bit 0 is reserved for environment (COLLISION_GROUP_ENVIRONMENT).
+ * Bits 1-15 give 15 unique ragdoll slots. The modulo wraps at 15, so
+ * ragdoll indices >= 15 will share a bit with an earlier ragdoll and
+ * those two ragdolls will NOT collide with each other.
+ * This is safe as long as MAX_PLAYERS <= 15 (currently 8).
  */
 function ragdollCollisionGroup(ragdollIndex: number): number {
   const selfBit = 1 << ((ragdollIndex % 15) + 1); // bits 1-15
@@ -247,12 +284,81 @@ export class RagdollManager {
     const dz = raisedPos.z - currentPos.z;
     const distSq = dx * dx + dy * dy + dz * dz;
 
-    if (distSq > 4.0) {
-      // Teleport: snap all bodies to proper positions relative to target
+    if (distSq > 16.0) {
+      // Hard teleport (>4m): snap all bodies to proper positions relative to target
+      ragdoll.smoothing = false;
       this.teleportAll(ragdoll, raisedPos, facingYaw);
+    } else if (distSq > 1.0) {
+      // Medium correction (>1m, <=4m): smooth correction via exponential smoothing
+      // Set the smooth target and let it lerp over subsequent frames
+      ragdoll.smoothTargetX = raisedPos.x;
+      ragdoll.smoothTargetY = raisedPos.y;
+      ragdoll.smoothTargetZ = raisedPos.z;
+      ragdoll.smoothing = true;
+
+      // Lerp toward the smooth target
+      const smoothFactor = 1 - Math.exp(-RAGDOLL_CORRECTION_SMOOTH_RATE * dt);
+      const smoothedPos = {
+        x: currentPos.x + (ragdoll.smoothTargetX - currentPos.x) * smoothFactor,
+        y: currentPos.y + (ragdoll.smoothTargetY - currentPos.y) * smoothFactor,
+        z: currentPos.z + (ragdoll.smoothTargetZ - currentPos.z) * smoothFactor,
+      };
+
+      torso.setNextKinematicTranslation(smoothedPos);
+
+      // Lean + rotation still applies during smoothing
+      const accelX = (velocity.x - ragdoll.prevVelX) / Math.max(dt, 1/120);
+      const accelZ = (velocity.z - ragdoll.prevVelZ) / Math.max(dt, 1/120);
+      ragdoll.prevVelX = velocity.x;
+      ragdoll.prevVelZ = velocity.z;
+
+      const cosYaw = Math.cos(facingYaw);
+      const sinYaw = Math.sin(facingYaw);
+      const localAccelForward = accelX * sinYaw + accelZ * cosYaw;
+      const localAccelLateral = accelX * cosYaw - accelZ * sinYaw;
+
+      const targetPitch = -localAccelForward * LEAN_ACCELERATION_FACTOR;
+      const targetRoll = localAccelLateral * LEAN_ACCELERATION_FACTOR;
+
+      const decayFactor = 1 - Math.exp(-LEAN_DECAY_RATE * dt);
+      ragdoll.leanPitchRad += (targetPitch - ragdoll.leanPitchRad) * decayFactor;
+      ragdoll.leanRollRad += (targetRoll - ragdoll.leanRollRad) * decayFactor;
+
+      // Upright controller: scale lean limits by stiffness.
+      // At full stiffness, lean is tight (UPRIGHT_MAX_LEAN). When floppy, lean is loose (UPRIGHT_FLOPPY_LEAN).
+      const smoothLeanLimit = UPRIGHT_MAX_LEAN + (UPRIGHT_FLOPPY_LEAN - UPRIGHT_MAX_LEAN) * (1 - ragdoll.stiffnessScale);
+      const smoothPitchLimit = Math.min(LEAN_MAX_PITCH + smoothLeanLimit, Math.PI * 0.45);
+      const smoothRollLimit = Math.min(LEAN_MAX_ROLL + smoothLeanLimit, Math.PI * 0.4);
+      ragdoll.leanPitchRad = Math.max(-smoothPitchLimit, Math.min(smoothPitchLimit, ragdoll.leanPitchRad));
+      ragdoll.leanRollRad = Math.max(-smoothRollLimit, Math.min(smoothRollLimit, ragdoll.leanRollRad));
+
+      const leanQuat = composeLeanQuat(facingYaw, ragdoll.leanPitchRad, ragdoll.leanRollRad);
+      torso.setNextKinematicRotation(leanQuat);
     } else {
-      // Normal: only move torso kinematically, limbs follow via joints
-      torso.setTranslation(raisedPos, true);
+      // Normal driving (<=1m): use setNextKinematic* for proper fictitious velocity
+
+      // If we were smoothing toward a target, continue lerping
+      let drivePos = raisedPos;
+      if (ragdoll.smoothing) {
+        ragdoll.smoothTargetX = raisedPos.x;
+        ragdoll.smoothTargetY = raisedPos.y;
+        ragdoll.smoothTargetZ = raisedPos.z;
+        const smoothFactor = 1 - Math.exp(-RAGDOLL_CORRECTION_SMOOTH_RATE * dt);
+        drivePos = {
+          x: currentPos.x + (ragdoll.smoothTargetX - currentPos.x) * smoothFactor,
+          y: currentPos.y + (ragdoll.smoothTargetY - currentPos.y) * smoothFactor,
+          z: currentPos.z + (ragdoll.smoothTargetZ - currentPos.z) * smoothFactor,
+        };
+        // Stop smoothing once we're close enough
+        const remDx = ragdoll.smoothTargetX - drivePos.x;
+        const remDy = ragdoll.smoothTargetY - drivePos.y;
+        const remDz = ragdoll.smoothTargetZ - drivePos.z;
+        if (remDx * remDx + remDy * remDy + remDz * remDz < 0.01) {
+          ragdoll.smoothing = false;
+        }
+      }
+
+      torso.setNextKinematicTranslation(drivePos);
 
       // ── Torso lean system (Gang Beasts "balancing on a ball") ──
       // Compute acceleration from velocity delta
@@ -283,9 +389,13 @@ export class RagdollManager {
       ragdoll.leanRollRad += Math.sin(ragdoll.idleSwayPhase) * IDLE_SWAY_AMPLITUDE * idleBlend;
       ragdoll.leanPitchRad += Math.sin(ragdoll.idleSwayPhase * 0.7 + 1.3) * IDLE_SWAY_AMPLITUDE * 0.5 * idleBlend;
 
-      // Clamp lean angles
-      ragdoll.leanPitchRad = Math.max(-LEAN_MAX_PITCH, Math.min(LEAN_MAX_PITCH, ragdoll.leanPitchRad));
-      ragdoll.leanRollRad = Math.max(-LEAN_MAX_ROLL, Math.min(LEAN_MAX_ROLL, ragdoll.leanRollRad));
+      // Upright controller: scale lean limits by stiffness.
+      // At full stiffness, lean is tight (UPRIGHT_MAX_LEAN). When floppy, lean is loose (UPRIGHT_FLOPPY_LEAN).
+      const leanLimit = UPRIGHT_MAX_LEAN + (UPRIGHT_FLOPPY_LEAN - UPRIGHT_MAX_LEAN) * (1 - ragdoll.stiffnessScale);
+      const pitchLimit = Math.min(LEAN_MAX_PITCH + leanLimit, Math.PI * 0.45);
+      const rollLimit = Math.min(LEAN_MAX_ROLL + leanLimit, Math.PI * 0.4);
+      ragdoll.leanPitchRad = Math.max(-pitchLimit, Math.min(pitchLimit, ragdoll.leanPitchRad));
+      ragdoll.leanRollRad = Math.max(-rollLimit, Math.min(rollLimit, ragdoll.leanRollRad));
 
       // Landing detection
       const airborne = position.y > 0.6;
@@ -314,7 +424,7 @@ export class RagdollManager {
 
       // Compose lean rotation with facing yaw
       const leanQuat = composeLeanQuat(facingYaw, ragdoll.leanPitchRad, ragdoll.leanRollRad);
-      torso.setRotation(leanQuat, true);
+      torso.setNextKinematicRotation(leanQuat);
     }
 
     // Update state machine
@@ -323,7 +433,23 @@ export class RagdollManager {
     // Compute pose targets based on movement
     const speed = Math.sqrt(velocity.x * velocity.x + velocity.z * velocity.z);
     const isMoving = speed > 0.5;
-    const now = performance.now() / 1000;
+
+    // ── Distance-based walk phase ──
+    // Advance walk phase based on actual distance traveled, not time.
+    // This ensures legs match movement speed (no sliding or moonwalking).
+    const distanceThisFrame = speed * dt;
+    ragdoll.walkDistance += distanceThisFrame;
+    ragdoll.walkPhase = (ragdoll.walkDistance * WALK_PHASE_RATE) % (Math.PI * 2);
+
+    // Add stumble perturbation when stiffness is low (hit reaction / recovering).
+    // Uses a per-ragdoll noise seed so each character stumbles differently.
+    if (ragdoll.stiffnessScale < 0.6 && isMoving) {
+      const stumbleStrength = (1 - ragdoll.stiffnessScale / 0.6) * STUMBLE_PHASE_AMPLITUDE;
+      const t = performance.now() / 1000;
+      const noise = Math.sin(t * STUMBLE_PHASE_FREQUENCY + ragdoll.stumbleNoiseSeed)
+                   + Math.sin(t * STUMBLE_PHASE_FREQUENCY * 1.7 + ragdoll.stumbleNoiseSeed * 0.73) * 0.5;
+      ragdoll.walkPhase += noise * stumbleStrength;
+    }
 
     // Update attack timer
     if (ragdoll.attackType !== "none") {
@@ -345,7 +471,7 @@ export class RagdollManager {
 
     // Apply PD motor targets with current stiffness scale
     const scale = ragdoll.stiffnessScale;
-    applyMotorTargets(ragdoll, scale, isMoving, now, speed, dt, isSprinting);
+    applyMotorTargets(ragdoll, scale, isMoving, ragdoll.walkPhase, speed, dt, isSprinting);
   }
 
   /** Teleport all ragdoll bodies to proper positions relative to a target root position. */
@@ -633,6 +759,11 @@ export class RagdollManager {
     }
   }
 
+  /** Expose the internal Rapier world (e.g. for PhysicsLab to add static colliders). */
+  getWorld(): RAPIER.World {
+    return this.world;
+  }
+
   /** Step the physics world. */
   step(dt: number): void {
     this.world.timestep = Math.min(dt, 1 / 30);
@@ -737,6 +868,33 @@ export class RagdollManager {
   }
 }
 
+// ── Dimension helper for blob vs ragdoll mode ──
+
+function getBlobDimensions() {
+  if (USE_BLOB_VISUALS) {
+    return {
+      torsoHalfHeight: BLOB_TORSO_HALF_HEIGHT,
+      torsoRadius: BLOB_TORSO_RADIUS,
+      headRadius: BLOB_HEAD_RADIUS,
+      upperArmHalfLength: BLOB_UPPER_ARM_HALF_LENGTH,
+      lowerArmHalfLength: BLOB_LOWER_ARM_HALF_LENGTH,
+      thighHalfLength: BLOB_THIGH_HALF_LENGTH,
+      shinHalfLength: BLOB_SHIN_HALF_LENGTH,
+      limbRadius: BLOB_LIMB_RADIUS,
+    };
+  }
+  return {
+    torsoHalfHeight: RAGDOLL_TORSO_HALF_HEIGHT,
+    torsoRadius: RAGDOLL_TORSO_RADIUS,
+    headRadius: RAGDOLL_HEAD_RADIUS,
+    upperArmHalfLength: RAGDOLL_UPPER_ARM_HALF_LENGTH,
+    lowerArmHalfLength: RAGDOLL_LOWER_ARM_HALF_LENGTH,
+    thighHalfLength: RAGDOLL_THIGH_HALF_LENGTH,
+    shinHalfLength: RAGDOLL_SHIN_HALF_LENGTH,
+    limbRadius: RAGDOLL_LIMB_RADIUS,
+  };
+}
+
 // ── Ragdoll creation ──
 
 function createRagdoll(world: RAPIER.World, ragdollIndex: number): RagdollInstance {
@@ -765,6 +923,20 @@ function createRagdoll(world: RAPIER.World, ragdollIndex: number): RagdollInstan
     r_thigh: 0.05,
   };
 
+  // Resolve dimensions based on blob vs ragdoll mode
+  const dim = getBlobDimensions();
+
+  // Per-limb mass for blob mode: head lighter (0.3), arms medium (0.8), legs heavier (1.2)
+  const limbMass: Record<string, number> = USE_BLOB_VISUALS
+    ? {
+        head: 0.3,
+        l_upper_arm: 0.8, r_upper_arm: 0.8,
+        l_lower_arm: 0.8, r_lower_arm: 0.8,
+        l_thigh: 1.2, r_thigh: 1.2,
+        l_shin: 1.2, r_shin: 1.2,
+      }
+    : {};
+
   // Helper to create a body part
   function makePart(
     name: BoneName,
@@ -783,22 +955,28 @@ function createRagdoll(world: RAPIER.World, ragdollIndex: number): RagdollInstan
 
     const rb = world.createRigidBody(desc);
 
+    // Resolve mass: blob mode uses per-limb tuned masses, default mode uses 1.0/0.5
+    const defaultMass = halfHeight > 0.01 ? 1.0 : 0.5;
+    const mass = isRoot ? 0 : (limbMass[name] ?? defaultMass);
+
     if (halfHeight > 0.01) {
       world.createCollider(
         RAPIER.ColliderDesc.capsule(halfHeight, radius)
           .setCollisionGroups(group)
-          .setMass(isRoot ? 0 : 1.0)
+          .setMass(mass)
           .setFriction(limbFriction[name] ?? 0.3)
-          .setRestitution(0.05),
+          .setRestitution(0.05)
+          .setContactSkin(RAGDOLL_CONTACT_SKIN),
         rb,
       );
     } else {
       world.createCollider(
         RAPIER.ColliderDesc.ball(radius)
           .setCollisionGroups(group)
-          .setMass(isRoot ? 0 : 0.5)
+          .setMass(mass)
           .setFriction(limbFriction[name] ?? 0.3)
-          .setRestitution(0.05),
+          .setRestitution(0.05)
+          .setContactSkin(RAGDOLL_CONTACT_SKIN),
         rb,
       );
     }
@@ -810,29 +988,29 @@ function createRagdoll(world: RAPIER.World, ragdollIndex: number): RagdollInstan
   // Create body parts at origin (they'll be positioned by driveToPosition)
   const px = 0, py = 1.0, pz = 0;
 
-  const torso = makePart("torso", { x: px, y: py, z: pz }, RAGDOLL_TORSO_HALF_HEIGHT, RAGDOLL_TORSO_RADIUS, true);
+  const torso = makePart("torso", { x: px, y: py, z: pz }, dim.torsoHalfHeight, dim.torsoRadius, true);
 
-  const headY = py + RAGDOLL_TORSO_HALF_HEIGHT + RAGDOLL_HEAD_RADIUS + 0.08;
-  makePart("head", { x: px, y: headY, z: pz }, 0, RAGDOLL_HEAD_RADIUS, false);
+  const headY = py + dim.torsoHalfHeight + dim.headRadius + 0.08;
+  makePart("head", { x: px, y: headY, z: pz }, 0, dim.headRadius, false);
 
-  const shoulderY = py + RAGDOLL_TORSO_HALF_HEIGHT * 0.7;
-  const shoulderX = RAGDOLL_TORSO_RADIUS + RAGDOLL_UPPER_ARM_HALF_LENGTH + 0.02;
+  const shoulderY = py + dim.torsoHalfHeight * 0.7;
+  const shoulderX = dim.torsoRadius + dim.upperArmHalfLength + 0.02;
 
-  makePart("l_upper_arm", { x: px - shoulderX, y: shoulderY, z: pz }, RAGDOLL_UPPER_ARM_HALF_LENGTH, RAGDOLL_LIMB_RADIUS, false);
-  makePart("r_upper_arm", { x: px + shoulderX, y: shoulderY, z: pz }, RAGDOLL_UPPER_ARM_HALF_LENGTH, RAGDOLL_LIMB_RADIUS, false);
+  makePart("l_upper_arm", { x: px - shoulderX, y: shoulderY, z: pz }, dim.upperArmHalfLength, dim.limbRadius, false);
+  makePart("r_upper_arm", { x: px + shoulderX, y: shoulderY, z: pz }, dim.upperArmHalfLength, dim.limbRadius, false);
 
-  const elbowY = shoulderY - RAGDOLL_UPPER_ARM_HALF_LENGTH * 2 - 0.02;
-  makePart("l_lower_arm", { x: px - shoulderX, y: elbowY, z: pz }, RAGDOLL_LOWER_ARM_HALF_LENGTH, RAGDOLL_LIMB_RADIUS * 0.9, false);
-  makePart("r_lower_arm", { x: px + shoulderX, y: elbowY, z: pz }, RAGDOLL_LOWER_ARM_HALF_LENGTH, RAGDOLL_LIMB_RADIUS * 0.9, false);
+  const elbowY = shoulderY - dim.upperArmHalfLength * 2 - 0.02;
+  makePart("l_lower_arm", { x: px - shoulderX, y: elbowY, z: pz }, dim.lowerArmHalfLength, dim.limbRadius * 0.9, false);
+  makePart("r_lower_arm", { x: px + shoulderX, y: elbowY, z: pz }, dim.lowerArmHalfLength, dim.limbRadius * 0.9, false);
 
-  const hipY = py - RAGDOLL_TORSO_HALF_HEIGHT;
+  const hipY = py - dim.torsoHalfHeight;
   const hipX = 0.12;
-  makePart("l_thigh", { x: px - hipX, y: hipY - RAGDOLL_THIGH_HALF_LENGTH, z: pz }, RAGDOLL_THIGH_HALF_LENGTH, RAGDOLL_LIMB_RADIUS * 1.1, false);
-  makePart("r_thigh", { x: px + hipX, y: hipY - RAGDOLL_THIGH_HALF_LENGTH, z: pz }, RAGDOLL_THIGH_HALF_LENGTH, RAGDOLL_LIMB_RADIUS * 1.1, false);
+  makePart("l_thigh", { x: px - hipX, y: hipY - dim.thighHalfLength, z: pz }, dim.thighHalfLength, dim.limbRadius * 1.1, false);
+  makePart("r_thigh", { x: px + hipX, y: hipY - dim.thighHalfLength, z: pz }, dim.thighHalfLength, dim.limbRadius * 1.1, false);
 
-  const kneeY = hipY - RAGDOLL_THIGH_HALF_LENGTH * 2 - 0.02;
-  makePart("l_shin", { x: px - hipX, y: kneeY - RAGDOLL_SHIN_HALF_LENGTH, z: pz }, RAGDOLL_SHIN_HALF_LENGTH, RAGDOLL_LIMB_RADIUS * 0.85, false);
-  makePart("r_shin", { x: px + hipX, y: kneeY - RAGDOLL_SHIN_HALF_LENGTH, z: pz }, RAGDOLL_SHIN_HALF_LENGTH, RAGDOLL_LIMB_RADIUS * 0.85, false);
+  const kneeY = hipY - dim.thighHalfLength * 2 - 0.02;
+  makePart("l_shin", { x: px - hipX, y: kneeY - dim.shinHalfLength, z: pz }, dim.shinHalfLength, dim.limbRadius * 0.85, false);
+  makePart("r_shin", { x: px + hipX, y: kneeY - dim.shinHalfLength, z: pz }, dim.shinHalfLength, dim.limbRadius * 0.85, false);
 
   // ── Create joints ──
 
@@ -849,8 +1027,8 @@ function createRagdoll(world: RAPIER.World, ragdollIndex: number): RagdollInstan
   // Head → Torso (spherical, stiff)
   const headJoint = world.createImpulseJoint(
     RAPIER.JointData.spherical(
-      { x: 0, y: RAGDOLL_TORSO_HALF_HEIGHT + 0.04, z: 0 },
-      { x: 0, y: -(RAGDOLL_HEAD_RADIUS + 0.04), z: 0 },
+      { x: 0, y: dim.torsoHalfHeight + 0.04, z: 0 },
+      { x: 0, y: -(dim.headRadius + 0.04), z: 0 },
     ),
     torso,
     head,
@@ -862,8 +1040,8 @@ function createRagdoll(world: RAPIER.World, ragdollIndex: number): RagdollInstan
   // Left Shoulder (spherical)
   const lShoulderJoint = world.createImpulseJoint(
     RAPIER.JointData.spherical(
-      { x: -(RAGDOLL_TORSO_RADIUS + 0.01), y: RAGDOLL_TORSO_HALF_HEIGHT * 0.7, z: 0 },
-      { x: 0, y: RAGDOLL_UPPER_ARM_HALF_LENGTH, z: 0 },
+      { x: -(dim.torsoRadius + 0.01), y: dim.torsoHalfHeight * 0.7, z: 0 },
+      { x: 0, y: dim.upperArmHalfLength, z: 0 },
     ),
     torso,
     lUpperArm,
@@ -875,8 +1053,8 @@ function createRagdoll(world: RAPIER.World, ragdollIndex: number): RagdollInstan
   // Right Shoulder (spherical)
   const rShoulderJoint = world.createImpulseJoint(
     RAPIER.JointData.spherical(
-      { x: RAGDOLL_TORSO_RADIUS + 0.01, y: RAGDOLL_TORSO_HALF_HEIGHT * 0.7, z: 0 },
-      { x: 0, y: RAGDOLL_UPPER_ARM_HALF_LENGTH, z: 0 },
+      { x: dim.torsoRadius + 0.01, y: dim.torsoHalfHeight * 0.7, z: 0 },
+      { x: 0, y: dim.upperArmHalfLength, z: 0 },
     ),
     torso,
     rUpperArm,
@@ -888,8 +1066,8 @@ function createRagdoll(world: RAPIER.World, ragdollIndex: number): RagdollInstan
   // Left Elbow (revolute)
   const lElbowJoint = world.createImpulseJoint(
     RAPIER.JointData.revolute(
-      { x: 0, y: -RAGDOLL_UPPER_ARM_HALF_LENGTH, z: 0 },
-      { x: 0, y: RAGDOLL_LOWER_ARM_HALF_LENGTH, z: 0 },
+      { x: 0, y: -dim.upperArmHalfLength, z: 0 },
+      { x: 0, y: dim.lowerArmHalfLength, z: 0 },
       { x: 1, y: 0, z: 0 },
     ),
     lUpperArm,
@@ -906,8 +1084,8 @@ function createRagdoll(world: RAPIER.World, ragdollIndex: number): RagdollInstan
   // Right Elbow (revolute)
   const rElbowJoint = world.createImpulseJoint(
     RAPIER.JointData.revolute(
-      { x: 0, y: -RAGDOLL_UPPER_ARM_HALF_LENGTH, z: 0 },
-      { x: 0, y: RAGDOLL_LOWER_ARM_HALF_LENGTH, z: 0 },
+      { x: 0, y: -dim.upperArmHalfLength, z: 0 },
+      { x: 0, y: dim.lowerArmHalfLength, z: 0 },
       { x: 1, y: 0, z: 0 },
     ),
     rUpperArm,
@@ -924,8 +1102,8 @@ function createRagdoll(world: RAPIER.World, ragdollIndex: number): RagdollInstan
   // Left Hip (spherical)
   const lHipJoint = world.createImpulseJoint(
     RAPIER.JointData.spherical(
-      { x: -hipX, y: -RAGDOLL_TORSO_HALF_HEIGHT, z: 0 },
-      { x: 0, y: RAGDOLL_THIGH_HALF_LENGTH, z: 0 },
+      { x: -hipX, y: -dim.torsoHalfHeight, z: 0 },
+      { x: 0, y: dim.thighHalfLength, z: 0 },
     ),
     torso,
     lThigh,
@@ -937,8 +1115,8 @@ function createRagdoll(world: RAPIER.World, ragdollIndex: number): RagdollInstan
   // Right Hip (spherical)
   const rHipJoint = world.createImpulseJoint(
     RAPIER.JointData.spherical(
-      { x: hipX, y: -RAGDOLL_TORSO_HALF_HEIGHT, z: 0 },
-      { x: 0, y: RAGDOLL_THIGH_HALF_LENGTH, z: 0 },
+      { x: hipX, y: -dim.torsoHalfHeight, z: 0 },
+      { x: 0, y: dim.thighHalfLength, z: 0 },
     ),
     torso,
     rThigh,
@@ -950,8 +1128,8 @@ function createRagdoll(world: RAPIER.World, ragdollIndex: number): RagdollInstan
   // Left Knee (revolute)
   const lKneeJoint = world.createImpulseJoint(
     RAPIER.JointData.revolute(
-      { x: 0, y: -RAGDOLL_THIGH_HALF_LENGTH, z: 0 },
-      { x: 0, y: RAGDOLL_SHIN_HALF_LENGTH, z: 0 },
+      { x: 0, y: -dim.thighHalfLength, z: 0 },
+      { x: 0, y: dim.shinHalfLength, z: 0 },
       { x: 1, y: 0, z: 0 },
     ),
     lThigh,
@@ -968,8 +1146,8 @@ function createRagdoll(world: RAPIER.World, ragdollIndex: number): RagdollInstan
   // Right Knee (revolute)
   const rKneeJoint = world.createImpulseJoint(
     RAPIER.JointData.revolute(
-      { x: 0, y: -RAGDOLL_THIGH_HALF_LENGTH, z: 0 },
-      { x: 0, y: RAGDOLL_SHIN_HALF_LENGTH, z: 0 },
+      { x: 0, y: -dim.thighHalfLength, z: 0 },
+      { x: 0, y: dim.shinHalfLength, z: 0 },
       { x: 1, y: 0, z: 0 },
     ),
     rThigh,
@@ -1021,6 +1199,13 @@ function createRagdoll(world: RAPIER.World, ragdollIndex: number): RagdollInstan
     animTargetPositions: new Map(),
     animTargetQuaternions: new Map(),
     hasAnimTargets: false,
+    smoothTargetX: 0,
+    smoothTargetY: 0,
+    smoothTargetZ: 0,
+    smoothing: false,
+    walkPhase: 0,
+    walkDistance: 0,
+    stumbleNoiseSeed: Math.random() * 1000,
   };
 }
 
@@ -1030,7 +1215,7 @@ function applyMotorTargets(
   ragdoll: RagdollInstance,
   _stiffnessScale: number,
   isMoving: boolean,
-  timeSec: number,
+  walkPhase: number,
   speed: number,
   _dt: number,
   isSprinting = false,
@@ -1043,8 +1228,11 @@ function applyMotorTargets(
   const atkSide = ragdoll.attackArm; // "left" or "right"
   const atkPrefix = atkSide === "left" ? "l_" : "r_";
 
-  // Walk cycle frequency: faster when sprinting
-  const walkFreq = isSprinting ? 12 : 8;
+  // Sprint exaggeration multiplier
+  const sprintMul = isSprinting ? SPRINT_SWING_MULTIPLIER : 1.0;
+
+  // Time-based value (only for idle poses, not walk cycle)
+  const timeSec = performance.now() / 1000;
 
   // Revolute joints (elbows, knees) — set motor targets
   for (const [name, joint] of ragdoll.joints) {
@@ -1079,11 +1267,13 @@ function applyMotorTargets(
             continue; // skip the procedural target
           }
         }
-        // Normal arm swing — snappier with pow shaping, slight phase offset from legs
+        // Normal arm swing — distance-based phase, counter-rotated to legs.
+        // Arms use walkPhase directly (offset by PI from the same-side leg for counter-rotation).
         const armPhaseOffset = 0.3; // arms lag behind legs slightly for natural counter-rotation
-        const rawSwing = isMoving ? Math.sin(timeSec * walkFreq + (name.includes("l_") ? 0 : Math.PI) + armPhaseOffset) : 0;
+        const sidePhase = name.includes("l_") ? 0 : Math.PI;
+        const rawSwing = isMoving ? Math.sin(walkPhase + sidePhase + armPhaseOffset) : 0;
         const shaped = Math.sign(rawSwing) * Math.pow(Math.abs(rawSwing), 0.7);
-        const swing = isMoving ? shaped * (isSprinting ? 0.8 : 0.6) : 0.05;
+        const swing = isMoving ? shaped * 0.6 * sprintMul : 0.05;
         rev.configureMotorPosition(swing, pd.kp * scale, pd.kd * scale);
       }
     }
@@ -1108,11 +1298,13 @@ function applyMotorTargets(
       }
 
       if (isMoving) {
-        // Asymmetric knee lift: only bend on "lift" half of cycle
-        const raw = Math.sin(timeSec * walkFreq + (name.includes("l_") ? Math.PI : 0));
+        // Asymmetric knee lift: only bend on "lift" half of cycle.
+        // Uses distance-based walkPhase so legs match actual movement speed.
+        const sidePhase = name.includes("l_") ? Math.PI : 0;
+        const raw = Math.sin(walkPhase + sidePhase);
         const liftOnly = Math.max(0, raw);
-        const liftAmt = isSprinting ? 0.7 : 0.4;
-        const bend = 0.3 + liftOnly * liftAmt;
+        const liftAmt = isSprinting ? SPRINT_KNEE_LIFT : WALK_KNEE_LIFT;
+        const bend = 0.3 + liftOnly * liftAmt * sprintMul;
         rev.configureMotorPosition(bend, pd.kp * scale, pd.kd * scale);
       } else {
         // Idle: slight bend
@@ -1121,101 +1313,103 @@ function applyMotorTargets(
     }
   }
 
-  // For spherical joints, we can't directly set motor positions in Rapier's
-  // spherical joint API (no configureMotorPosition on spherical). Instead, we
-  // use impulses on the connected bodies to guide them toward target poses.
-  // This is the "force-based" approach for spherical DOF.
+  // ── Spherical joints: quaternion PD torque controller ──
+  // Instead of position-based spring impulses, we compute rotational error
+  // between parent and child body and apply corrective torque impulses.
+  // This is more stable and physically correct for spherical DOF.
 
-  const shoulderPD = RAGDOLL_PD.shoulder;
-  const hipPD = RAGDOLL_PD.hip;
-
-  // Shoulder guidance — pull upper arms toward rest position relative to torso
   const torsoBody = ragdoll.bodies.get("torso")!;
   const torsoPos = torsoBody.translation();
   const torsoRot = torsoBody.rotation();
 
+  // ── Shoulder guidance (quaternion PD torque) ──
   for (const side of ["l", "r"] as const) {
     const armBone = `${side}_upper_arm` as BoneName;
     const armScale = limbScale(armBone);
     const upperArm = ragdoll.bodies.get(armBone)!;
-    const armPos = upperArm.translation();
-
-    // Target: arms hanging at sides with slight outward angle
     const sideSign = side === "l" ? -1 : 1;
-    const shoulderOffset = RAGDOLL_TORSO_RADIUS + RAGDOLL_UPPER_ARM_HALF_LENGTH;
 
-    // Compute target arm position in world space (relative to torso)
-    const targetLocal = {
-      x: sideSign * shoulderOffset,
-      y: RAGDOLL_TORSO_HALF_HEIGHT * 0.7 - RAGDOLL_UPPER_ARM_HALF_LENGTH,
-      z: isSprinting ? 0.15 : 0, // trail arms behind during sprint
-    };
-
-    // Attack pose: push attacking arm forward/back
     const isSideAttacking = attacking && ((side === "l" && atkSide === "left") || (side === "r" && atkSide === "right"));
+
+    // Compute target relative quaternion for the shoulder joint.
+    // Identity = rest pose (arm hanging straight down from shoulder).
+    // We build a target quaternion from the desired arm swing/attack angles.
+
+    // Walk cycle: arm swing is a rotation about the X axis (pitch, forward/back)
+    let shoulderPitchRad = 0; // forward/back swing
+    let shoulderRollRad = 0;  // outward/inward
+    let shoulderYawRad = 0;   // twist (used for attacks)
+
     if (isSideAttacking) {
+      // Attack poses expressed as rotational offsets
       if (ragdoll.attackType === "light") {
-        // Jab: push arm forward
-        targetLocal.z -= 0.35;
-        targetLocal.y += 0.15;
+        // Jab: rotate arm forward (negative pitch = arm goes forward in local space)
+        shoulderPitchRad = -1.2;
+        shoulderRollRad = 0.1;
       } else {
-        // Heavy swing
         if (ragdoll.attackPhase === "windup") {
-          // Pull arm back and to the side
-          targetLocal.z += 0.25;
-          targetLocal.x += sideSign * 0.1;
+          shoulderPitchRad = 0.8;            // arm pulled back
+          shoulderRollRad = sideSign * 0.3;  // arm out to side
         } else if (ragdoll.attackPhase === "strike") {
-          // Swing across: arm goes forward and opposite side
-          targetLocal.z -= 0.4;
-          targetLocal.x -= sideSign * 0.15;
-          targetLocal.y += 0.1;
+          shoulderPitchRad = -1.4;           // swing forward hard
+          shoulderYawRad = -sideSign * 0.4;  // swing across body
+          shoulderRollRad = 0.15;
         } else {
-          // Follow-through: arm continues past center
-          targetLocal.z -= 0.2;
-          targetLocal.x -= sideSign * 0.1;
+          // Follow-through
+          shoulderPitchRad = -0.7;
+          shoulderYawRad = -sideSign * 0.2;
         }
       }
+    } else if (isMoving) {
+      // Walk cycle arm swing: distance-based phase, counter-rotated to legs
+      const armPhaseOffset = 0.3; // arms lag slightly behind legs
+      const sidePhase = side === "l" ? 0 : Math.PI;
+      const rawSwing = Math.sin(walkPhase + sidePhase + armPhaseOffset);
+      const shaped = Math.sign(rawSwing) * Math.pow(Math.abs(rawSwing), 0.7);
+      shoulderPitchRad = shaped * 0.4 * sprintMul;
+      // Trail arms behind during sprint
+      if (isSprinting) shoulderPitchRad += 0.15;
     }
 
-    // Rotate by torso orientation
-    const target = rotateByQuat(targetLocal, torsoRot);
-    target.x += torsoPos.x;
-    target.y += torsoPos.y;
-    target.z += torsoPos.z;
-
-    // Override with animation target if available
+    // Override with animation target quaternion if available
+    let shoulderTargetQuat: Quat;
     if (ragdoll.hasAnimTargets) {
-      const animTarget = ragdoll.animTargetPositions.get(armBone);
-      if (animTarget) {
-        target.x = animTarget.x;
-        target.y = animTarget.y;
-        target.z = animTarget.z;
+      const animQ = ragdoll.animTargetQuaternions.get(armBone);
+      if (animQ) {
+        shoulderTargetQuat = animQ;
+      } else {
+        // Compose target quaternion: Ry(yaw) * Rx(pitch) * Rz(roll)
+        const qPitch = quatFromAxisAngle(1, 0, 0, shoulderPitchRad);
+        const qRoll = quatFromAxisAngle(0, 0, 1, shoulderRollRad);
+        const qYaw = quatFromAxisAngle(0, 1, 0, shoulderYawRad);
+        shoulderTargetQuat = quatMultiply(quatMultiply(qYaw, qPitch), qRoll);
       }
+    } else {
+      const qPitch = quatFromAxisAngle(1, 0, 0, shoulderPitchRad);
+      const qRoll = quatFromAxisAngle(0, 0, 1, shoulderRollRad);
+      const qYaw = quatFromAxisAngle(0, 1, 0, shoulderYawRad);
+      shoulderTargetQuat = quatMultiply(quatMultiply(qYaw, qPitch), qRoll);
     }
 
-    // Spring force toward target
-    const dx = target.x - armPos.x;
-    const dy = target.y - armPos.y;
-    const dz = target.z - armPos.z;
-
-    // Reduce idle arm forces to let arms hang naturally under gravity (prevents vertical bobbing)
-    const forceMult = isSideAttacking ? 2.0 : (!isMoving && !isSideAttacking ? 0.5 : 1.0);
-    const force = shoulderPD.kp * armScale * 0.01 * forceMult;
-    const damp = shoulderPD.kd * armScale * 0.01 * forceMult;
-    const vel = upperArm.linvel();
-
-    const armMass = 1.0; // arm collider mass
-    const gravCompArm = armMass * 12.0 * 0.016; // lighter compensation for arms (want some sag)
-    upperArm.applyImpulse(
-      {
-        x: dx * force - vel.x * damp,
-        y: dy * force - vel.y * damp + gravCompArm,
-        z: dz * force - vel.z * damp,
-      },
-      true,
+    // Boost PD gains during attacks for snappier response
+    const atkBoost = isSideAttacking ? 2.0 : 1.0;
+    applyQuaternionPDTorque(
+      torsoBody,
+      upperArm,
+      shoulderTargetQuat,
+      QUAT_PD.shoulder.kp * atkBoost,
+      QUAT_PD.shoulder.kd * atkBoost,
+      QUAT_PD.shoulder.maxTorque * atkBoost,
+      armScale,
     );
 
-    // Also push forearm forward during attack for full arm extension
+    // Gravity compensation for arm (still needed — torque alone doesn't fight gravity on position)
+    const armMass = 1.0;
+    const gravCompArm = armMass * 12.0 * 0.016;
+    const armVel = upperArm.linvel();
+    upperArm.applyImpulse({ x: -armVel.x * 0.01, y: gravCompArm, z: -armVel.z * 0.01 }, true);
+
+    // Attack forearm push (keep linear impulse for forearm extension during attacks)
     if (isSideAttacking) {
       const forearmBone = `${side}_lower_arm` as BoneName;
       const forearm = ragdoll.bodies.get(forearmBone)!;
@@ -1232,115 +1426,227 @@ function applyMotorTargets(
         const fdx = (torsoPos.x + fwd.x) - forearmPos.x;
         const fdy = (torsoPos.y + fwd.y) - forearmPos.y;
         const fdz = (torsoPos.z + fwd.z) - forearmPos.z;
-        const fForce = shoulderPD.kp * armScale * 0.008;
+        const fForce = RAGDOLL_PD.shoulder.kp * armScale * 0.008;
+        const fDamp = RAGDOLL_PD.shoulder.kd * armScale * 0.005;
         const fVel = forearm.linvel();
         forearm.applyImpulse(
           {
-            x: fdx * fForce - fVel.x * damp * 0.5,
-            y: fdy * fForce - fVel.y * damp * 0.5,
-            z: fdz * fForce - fVel.z * damp * 0.5,
+            x: fdx * fForce - fVel.x * fDamp,
+            y: fdy * fForce - fVel.y * fDamp,
+            z: fdz * fForce - fVel.z * fDamp,
           },
           true,
         );
       }
     }
 
-    // Hip guidance
+    // ── Hip guidance (quaternion PD torque) ──
     const thighBone = `${side}_thigh` as BoneName;
     const thighScale = limbScale(thighBone);
     const thigh = ragdoll.bodies.get(thighBone)!;
-    const thighPos = thigh.translation();
 
-    // Idle hip sway: subtle lateral movement when stationary
-    const idleSway = !isMoving ? Math.sin(timeSec * 1.2 + (side === "l" ? 0 : Math.PI)) * 0.01 : 0;
-    const hipTargetLocal = {
-      x: sideSign * 0.12 + idleSway,
-      y: -RAGDOLL_TORSO_HALF_HEIGHT - RAGDOLL_THIGH_HALF_LENGTH,
-      z: isMoving ? Math.sin(timeSec * walkFreq + (side === "l" ? 0 : Math.PI)) * 0.15 * speed * 0.15 : 0,
-    };
+    // Compute target relative quaternion for the hip joint.
+    // Walk cycle: leg swing is a rotation about the X axis (pitch)
+    let hipPitchRad = 0;
+    let hipRollRad = 0;
 
-    const hipTarget = rotateByQuat(hipTargetLocal, torsoRot);
-    hipTarget.x += torsoPos.x;
-    hipTarget.y += torsoPos.y;
-    hipTarget.z += torsoPos.z;
-
-    if (ragdoll.hasAnimTargets) {
-      const animTarget = ragdoll.animTargetPositions.get(thighBone);
-      if (animTarget) {
-        hipTarget.x = animTarget.x;
-        hipTarget.y = animTarget.y;
-        hipTarget.z = animTarget.z;
-      }
+    if (isMoving) {
+      // Walk/run leg swing: distance-based phase so legs match movement speed
+      const sidePhase = side === "l" ? 0 : Math.PI;
+      const rawSwing = Math.sin(walkPhase + sidePhase);
+      const swingAmt = 0.3 * sprintMul;
+      hipPitchRad = rawSwing * swingAmt * Math.min(speed * 0.15, 1.0);
+    } else {
+      // Idle hip sway: subtle lateral weight-shifting roll (time-based, not distance)
+      hipRollRad = Math.sin(timeSec * 1.2 + (side === "l" ? 0 : Math.PI)) * 0.02;
     }
 
-    const hdx = hipTarget.x - thighPos.x;
-    const hdy = hipTarget.y - thighPos.y;
-    const hdz = hipTarget.z - thighPos.z;
+    // Override with animation target quaternion if available
+    let hipTargetQuat: Quat;
+    if (ragdoll.hasAnimTargets) {
+      const animQ = ragdoll.animTargetQuaternions.get(thighBone);
+      if (animQ) {
+        hipTargetQuat = animQ;
+      } else {
+        const qPitch = quatFromAxisAngle(1, 0, 0, hipPitchRad);
+        const qRoll = quatFromAxisAngle(0, 0, 1, hipRollRad);
+        hipTargetQuat = quatMultiply(qPitch, qRoll);
+      }
+    } else {
+      const qPitch = quatFromAxisAngle(1, 0, 0, hipPitchRad);
+      const qRoll = quatFromAxisAngle(0, 0, 1, hipRollRad);
+      hipTargetQuat = quatMultiply(qPitch, qRoll);
+    }
 
-    const hForce = hipPD.kp * thighScale * 0.01;
-    const hDamp = hipPD.kd * thighScale * 0.01;
-    const hVel = thigh.linvel();
+    applyQuaternionPDTorque(
+      torsoBody,
+      thigh,
+      hipTargetQuat,
+      QUAT_PD.hip.kp,
+      QUAT_PD.hip.kd,
+      QUAT_PD.hip.maxTorque,
+      thighScale,
+    );
 
+    // Gravity compensation for thigh
     const thighMass = 1.0;
     const gravCompThigh = thighMass * 13.0 * 0.016;
-    thigh.applyImpulse(
-      {
-        x: hdx * hForce - hVel.x * hDamp,
-        y: hdy * hForce - hVel.y * hDamp + gravCompThigh,
-        z: hdz * hForce - hVel.z * hDamp,
-      },
-      true,
-    );
+    const thighVel = thigh.linvel();
+    thigh.applyImpulse({ x: -thighVel.x * 0.01, y: gravCompThigh, z: -thighVel.z * 0.01 }, true);
   }
 
-  // Head guidance — keep it upright above torso
+  // ── Head guidance (quaternion PD torque) ──
   const headScale = limbScale("head");
   const headBody = ragdoll.bodies.get("head")!;
-  const headPos = headBody.translation();
-  const headPD = RAGDOLL_PD.head;
 
-  // Idle breathing: very subtle head bob (reduced to prevent vertical oscillation with low PD gains)
-  const breathBob = !isMoving ? Math.sin(timeSec * 1.5) * 0.003 : 0;
-  const headTargetLocal = {
-    x: 0,
-    y: RAGDOLL_TORSO_HALF_HEIGHT + RAGDOLL_HEAD_RADIUS + 0.08 + breathBob,
-    z: isSprinting ? -0.06 : 0,
-  };
-  const headTarget = rotateByQuat(headTargetLocal, torsoRot);
-  headTarget.x += torsoPos.x;
-  headTarget.y += torsoPos.y;
-  headTarget.z += torsoPos.z;
+  // Compute target relative quaternion for the head.
+  // Rest pose = identity (head aligned with torso).
+  // Breathing adds a subtle pitch oscillation.
+  let headPitchRad = 0;
 
-  if (ragdoll.hasAnimTargets) {
-    const animTarget = ragdoll.animTargetPositions.get("head");
-    if (animTarget) {
-      headTarget.x = animTarget.x;
-      headTarget.y = animTarget.y;
-      headTarget.z = animTarget.z;
-    }
+  if (!isMoving) {
+    // Idle breathing: very subtle head nod
+    headPitchRad = Math.sin(timeSec * 1.5) * 0.02;
+  }
+  if (isSprinting) {
+    // Lean head forward slightly during sprint
+    headPitchRad -= 0.1;
   }
 
-  const hhdx = headTarget.x - headPos.x;
-  const hhdy = headTarget.y - headPos.y;
-  const hhdz = headTarget.z - headPos.z;
+  // Override with animation target quaternion if available
+  let headTargetQuat: Quat;
+  if (ragdoll.hasAnimTargets) {
+    const animQ = ragdoll.animTargetQuaternions.get("head");
+    if (animQ) {
+      headTargetQuat = animQ;
+    } else {
+      headTargetQuat = quatFromAxisAngle(1, 0, 0, headPitchRad);
+    }
+  } else {
+    headTargetQuat = quatFromAxisAngle(1, 0, 0, headPitchRad);
+  }
 
-  const headForce = headPD.kp * headScale * 0.01;
-  const headDamp = headPD.kd * headScale * 0.01;
+  applyQuaternionPDTorque(
+    torsoBody,
+    headBody,
+    headTargetQuat,
+    QUAT_PD.neck.kp,
+    QUAT_PD.neck.kd,
+    QUAT_PD.neck.maxTorque,
+    headScale,
+  );
+
+  // Gravity compensation for head (still needed for position)
+  const headMass = 0.5;
+  const gravCompHead = headMass * 14.0 * 0.016;
   const headVel = headBody.linvel();
-
-  // Extra vertical damping on head to suppress bounce oscillation from torso lean
-  const headVerticalDamp = headDamp * 2.5;
-  // Gravity compensation: counteract most of gravity so PD only handles error correction
-  const headMass = 0.5; // head collider mass
-  const gravCompHead = headMass * 14.0 * 0.016; // ~93% gravity compensation
   headBody.applyImpulse(
     {
-      x: hhdx * headForce - headVel.x * headDamp,
-      y: hhdy * headForce - headVel.y * headVerticalDamp + gravCompHead,
-      z: hhdz * headForce - headVel.z * headDamp,
+      x: -headVel.x * 0.02,
+      y: gravCompHead,
+      z: -headVel.z * 0.02,
     },
     true,
   );
+}
+
+// ── Quaternion math helpers ──
+
+type Quat = { x: number; y: number; z: number; w: number };
+
+function quatInverse(q: Quat): Quat {
+  return { x: -q.x, y: -q.y, z: -q.z, w: q.w };
+}
+
+function quatMultiply(a: Quat, b: Quat): Quat {
+  return {
+    x: a.w * b.x + a.x * b.w + a.y * b.z - a.z * b.y,
+    y: a.w * b.y - a.x * b.z + a.y * b.w + a.z * b.x,
+    z: a.w * b.z + a.x * b.y - a.y * b.x + a.z * b.w,
+    w: a.w * b.w - a.x * b.x - a.y * b.y - a.z * b.z,
+  };
+}
+
+/**
+ * Build a quaternion from an axis-angle rotation.
+ * @param ax Axis x (should be normalized)
+ * @param ay Axis y
+ * @param az Axis z
+ * @param angle Rotation angle in radians
+ */
+function quatFromAxisAngle(ax: number, ay: number, az: number, angle: number): Quat {
+  const half = angle * 0.5;
+  const s = Math.sin(half);
+  return { x: ax * s, y: ay * s, z: az * s, w: Math.cos(half) };
+}
+
+/**
+ * Quaternion PD torque controller for spherical joints.
+ * Computes corrective torque to drive bodyB's orientation toward a target
+ * relative rotation from bodyA.
+ *
+ * The torque is computed in world space (applyTorqueImpulse works in world space).
+ */
+function applyQuaternionPDTorque(
+  bodyA: RAPIER.RigidBody,
+  bodyB: RAPIER.RigidBody,
+  targetRelativeQuat: Quat,
+  kp: number,
+  kd: number,
+  maxTorque: number,
+  stiffnessScale: number,
+): void {
+  // 1. Get current relative rotation: qCurrent = inverse(qA) * qB
+  const qA = bodyA.rotation();
+  const qB = bodyB.rotation();
+  const qAinv = quatInverse(qA);
+  const qCurrent = quatMultiply(qAinv, qB);
+
+  // 2. Compute error quaternion: qErr = qTarget * inverse(qCurrent)
+  const qCurrentInv = quatInverse(qCurrent);
+  const qErr = quatMultiply(targetRelativeQuat, qCurrentInv);
+
+  // 3. Ensure shortest path (flip if w < 0)
+  let ex = qErr.x, ey = qErr.y, ez = qErr.z, ew = qErr.w;
+  if (ew < 0) { ex = -ex; ey = -ey; ez = -ez; ew = -ew; }
+
+  // 4. Convert to axis-angle (small angle approximation for stability)
+  const sinHalfAngle = Math.sqrt(ex * ex + ey * ey + ez * ez);
+  const angle = 2 * Math.atan2(sinHalfAngle, ew);
+
+  // Axis (normalized, with fallback for zero rotation)
+  let ax = 0, ay = 1, az = 0;
+  if (sinHalfAngle > 1e-6) {
+    const inv = 1 / sinHalfAngle;
+    ax = ex * inv; ay = ey * inv; az = ez * inv;
+  }
+
+  // 5. Compute relative angular velocity
+  const omegaA = bodyA.angvel();
+  const omegaB = bodyB.angvel();
+  const omegaRel = {
+    x: omegaB.x - omegaA.x,
+    y: omegaB.y - omegaA.y,
+    z: omegaB.z - omegaA.z,
+  };
+
+  // 6. PD torque = kp * angle * axis - kd * omegaRelative
+  const scale = stiffnessScale;
+  let tx = (kp * scale * angle * ax) - (kd * scale * omegaRel.x);
+  let ty = (kp * scale * angle * ay) - (kd * scale * omegaRel.y);
+  let tz = (kp * scale * angle * az) - (kd * scale * omegaRel.z);
+
+  // 7. Clamp torque magnitude
+  const mag = Math.sqrt(tx * tx + ty * ty + tz * tz);
+  const clampedMax = maxTorque * scale;
+  if (mag > clampedMax && mag > 1e-6) {
+    const s = clampedMax / mag;
+    tx *= s; ty *= s; tz *= s;
+  }
+
+  // 8. Apply equal/opposite torque impulses
+  bodyB.applyTorqueImpulse({ x: tx, y: ty, z: tz }, true);
+  bodyA.applyTorqueImpulse({ x: -tx, y: -ty, z: -tz }, true);
 }
 
 // ── Math helpers ──
